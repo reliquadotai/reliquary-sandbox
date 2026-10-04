@@ -16,6 +16,11 @@ from . import APIClient, CreateSandboxRequest, SandboxClient
 def _emit(value: Any, as_json: bool) -> None:
     if isinstance(value, BaseModel):
         value = value.model_dump(mode="json", by_alias=True)
+    elif isinstance(value, list):
+        value = [
+            item.model_dump(mode="json", by_alias=True) if isinstance(item, BaseModel) else item
+            for item in value
+        ]
     if as_json or isinstance(value, (dict, list)):
         print(json.dumps(value, indent=2, ensure_ascii=False))
     elif value is not None:
@@ -53,6 +58,23 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--env", action="append", default=[], metavar="KEY=VALUE")
     run.add_argument("command", nargs="+")
     commands.add_parser("delete", help="Terminate and remove a sandbox").add_argument("sandbox_id")
+    checkpoint = commands.add_parser("checkpoint", help="Snapshot the guest workspace files")
+    checkpoint.add_argument("sandbox_id")
+    checkpoint.add_argument("--wait", action="store_true", help="Wait for checkpoint durability")
+    checkpoint.add_argument("--timeout", type=float, default=300, help="Durability wait in seconds")
+    commands.add_parser("checkpoints", help="List a sandbox's workspace checkpoints").add_argument(
+        "sandbox_id"
+    )
+    restore = commands.add_parser("restore", help="Create a container from a workspace checkpoint")
+    restore.add_argument("checkpoint_id")
+    restore.add_argument("--name", default="restored-workspace")
+    restore.add_argument("--cpu", type=float, default=1)
+    restore.add_argument("--memory", type=float, default=1, help="Memory limit in GB")
+    restore.add_argument("--timeout", type=int, default=60, help="Lifetime in minutes")
+    restore.add_argument("--wait", action="store_true")
+    commands.add_parser("delete-checkpoint", help="Delete a retained workspace checkpoint").add_argument(
+        "checkpoint_id"
+    )
     upload = commands.add_parser("upload", help="Upload a local file")
     upload.add_argument("sandbox_id")
     upload.add_argument("local_path")
@@ -71,6 +93,8 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
+    if args.action == "restore" and args.runtime != "container":
+        parser.error("restore requires the container runtime")
     if args.base_url:
         os.environ["RELIQUARY_SANDBOX_API_BASE_URL"] = args.base_url
     api = None
@@ -120,6 +144,31 @@ def main(argv: list[str] | None = None) -> int:
             return min(result.exit_code, 125) if result.exit_code >= 0 else 1
         elif args.action == "delete":
             _emit(client.delete(args.sandbox_id), args.json)
+        elif args.action == "checkpoint":
+            checkpoint = client.checkpoint(args.sandbox_id)
+            if args.wait:
+                checkpoint = client.wait_for_checkpoint(
+                    checkpoint.id, timeout_seconds=args.timeout
+                )
+            _emit(checkpoint, args.json)
+        elif args.action == "checkpoints":
+            _emit(client.list_checkpoints(args.sandbox_id), args.json)
+        elif args.action == "restore":
+            sandbox = client.create(
+                CreateSandboxRequest(
+                    name=args.name,
+                    checkpoint_id=args.checkpoint_id,
+                    cpu_cores=args.cpu,
+                    memory_gb=args.memory,
+                    timeout_minutes=args.timeout,
+                )
+            )
+            if args.wait:
+                client.wait_for_creation(sandbox.id)
+                sandbox = client.get(sandbox.id)
+            _emit(sandbox, args.json)
+        elif args.action == "delete-checkpoint":
+            _emit(api.request("DELETE", f"/sandbox/checkpoints/{args.checkpoint_id}"), args.json)
         elif args.action == "upload":
             _emit(client.upload_file(args.sandbox_id, args.remote_path, args.local_path), args.json)
         elif args.action == "download":
