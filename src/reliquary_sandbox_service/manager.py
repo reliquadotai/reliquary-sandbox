@@ -41,6 +41,7 @@ class Manager:
         self.store = Store(settings.state_dir)
         self.lock = threading.RLock()
         self.operation_locks: dict[str, threading.RLock] = {}
+        self.checkpoint_locks = {tenant: threading.Lock() for tenant in settings.tokens}
 
     def operation_lock(self, sandbox_id):
         with self.lock:
@@ -243,34 +244,49 @@ class Manager:
             return result
 
     def checkpoint(self, tenant, sandbox_id):
-        with self.operation(tenant, sandbox_id), self.lock:
-            record = self.owned(tenant, sandbox_id, running=True)
-            if len(self.store.checkpoints(tenant)) >= self.settings.max_checkpoints_per_tenant:
-                raise HTTPException(429, "checkpoint quota exceeded")
+        with self.operation(tenant, sandbox_id):
+            admission = self.checkpoint_locks[tenant]
+            if not admission.acquire(blocking=False):
+                raise HTTPException(409, "checkpoint creation is busy")
             try:
-                snapshot = self.runtime.export_workspace(sandbox_id)
-            except ValueError as exc:
-                raise HTTPException(422, "workspace exceeds checkpoint limits") from exc
-            except Exception as exc:
-                self._failed_operation(tenant, sandbox_id)
-                raise HTTPException(503, "guest checkpoint unavailable") from exc
-            if len(snapshot) > self.settings.max_snapshot_bytes:
-                raise HTTPException(422, "workspace exceeds checkpoint limits")
-            now = timestamp()
-            parent = record.get("parent_checkpoint_id")
-            prior = self.store.checkpoint(tenant, parent) if parent else None
-            payload = {
-                "id": str(uuid.uuid4()), "sandbox_id": sandbox_id, "parent_id": parent,
-                "state": "DURABLE", "depth": prior[0]["depth"] + 1 if prior else 0,
-                "docker_image": record["docker_image"], "disk_size_bytes": int(record["disk_size_gb"] * 1024**3),
-                "stored_bytes": len(snapshot), "created_at": now, "updated_at": now,
-            }
-            self.store.save_checkpoint(tenant, payload, snapshot)
-            return payload
+                with self.lock:
+                    record = self.owned(tenant, sandbox_id, running=True)
+                    if len(self.store.checkpoints(tenant)) >= self.settings.max_checkpoints_per_tenant:
+                        raise HTTPException(429, "checkpoint quota exceeded")
+                    record["last_activity"] = time.time()
+                    self.store.save(record)
+                try:
+                    snapshot = self.runtime.export_workspace(sandbox_id)
+                except ValueError as exc:
+                    raise HTTPException(422, "workspace exceeds checkpoint limits") from exc
+                except Exception as exc:
+                    self._failed_operation(tenant, sandbox_id)
+                    raise HTTPException(503, "guest checkpoint unavailable") from exc
+                if len(snapshot) > self.settings.max_snapshot_bytes:
+                    raise HTTPException(422, "workspace exceeds checkpoint limits")
+                with self.lock:
+                    record = self.owned(tenant, sandbox_id, running=True)
+                    now = timestamp()
+                    parent = record.get("parent_checkpoint_id")
+                    prior = self.store.checkpoint(tenant, parent) if parent else None
+                    payload = {
+                        "id": str(uuid.uuid4()), "sandbox_id": sandbox_id, "parent_id": parent,
+                        "state": "DURABLE", "depth": prior[0]["depth"] + 1 if prior else 0,
+                        "docker_image": record["docker_image"], "disk_size_bytes": int(record["disk_size_gb"] * 1024**3),
+                        "stored_bytes": len(snapshot), "created_at": now, "updated_at": now,
+                    }
+                    self.store.save_checkpoint(tenant, payload, snapshot)
+                    record["last_activity"] = time.time()
+                    self.store.save(record)
+                    return payload
+            finally:
+                admission.release()
 
     def _failed_operation(self, tenant, sandbox_id):
         with self.lock:
             record = self.owned(tenant, sandbox_id)
+            if record["status"] not in ACTIVE:
+                return
             record.update(status="ERROR", cleanup_pending=True, error_type="RUNTIME_OPERATION_FAILED", error_message="runtime operation failed", updated_at=timestamp())
             self.store.save(record)
             try:

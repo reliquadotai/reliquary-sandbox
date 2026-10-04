@@ -226,6 +226,50 @@ def test_gateway_output_limit_returns_protocol_error(tmp_path):
         assert end["error"]["code"] == "resource_exhausted"
 
 
+@pytest.mark.parametrize("fail", [False, True])
+def test_checkpoint_export_allows_lifetime_cleanup_and_preserves_terminal_state(tmp_path, fail):
+    started, release = threading.Event(), threading.Event()
+
+    class PausedExport(FakeRuntime):
+        def export_workspace(self, sandbox_id):
+            started.set()
+            release.wait(5)
+            if fail:
+                raise RuntimeError("unavailable")
+            return b"checkpoint"
+
+    runtime = PausedExport()
+    manager = Manager(settings(tmp_path), runtime)
+    sandbox_id = manager.create("evals", request())["id"]
+    errors = []
+
+    def checkpoint():
+        try:
+            manager.checkpoint("evals", sandbox_id)
+        except HTTPException as error:
+            errors.append(error.status_code)
+
+    worker = threading.Thread(target=checkpoint)
+    worker.start()
+    try:
+        assert started.wait(1)
+        record = manager.owned("evals", sandbox_id)
+        record["expires_at"] = 0
+        manager.store.save(record)
+        manager.reap()
+        assert sandbox_id not in runtime.containers
+        release.set()
+        worker.join(2)
+        assert not worker.is_alive()
+        assert errors == [503 if fail else 409]
+        assert manager.owned("evals", sandbox_id)["status"] == "TIMEOUT"
+        assert not manager.store.checkpoints("evals")
+    finally:
+        release.set()
+        worker.join(2)
+        manager.store.close()
+
+
 def test_terminal_history_and_operation_locks_are_bounded(tmp_path):
     manager = Manager(settings(tmp_path, max_terminal_records_per_tenant=2), FakeRuntime())
     try:
