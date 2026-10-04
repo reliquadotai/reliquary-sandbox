@@ -18,7 +18,7 @@ The runtime uses Docker with gVisor `runsc`. It requires a dedicated Linux host 
 
    ```bash
    docker build --target guest -t reliquary-sandbox-guest:0.1.0 .
-   docker compose build
+   docker build --target controller -t reliquary-sandbox-controller:0.1.0 .
    ```
 
 3. Generate two tenant credentials in the ignored `.env` file:
@@ -80,6 +80,22 @@ finally:
 ```
 
 Use a different credential per tenant. The same API supports `AsyncSandboxClient`, and SDK clients can use another compatible deployment by selecting its API origin and runtime mode. See [API compatibility](docs/compatibility.md) for the supported server surface.
+
+## Command line
+
+The CLI uses the same API URL and credential environment variables:
+
+```bash
+uv run reliquary-sandbox create --name evaluation --wait --json
+uv run reliquary-sandbox run SANDBOX_ID 'python --version'
+uv run reliquary-sandbox checkpoint SANDBOX_ID --wait --json
+uv run reliquary-sandbox checkpoints SANDBOX_ID --json
+uv run reliquary-sandbox restore CHECKPOINT_ID --name restored-evaluation --wait --json
+uv run reliquary-sandbox delete SANDBOX_ID
+uv run reliquary-sandbox delete-checkpoint CHECKPOINT_ID
+```
+
+Replace the IDs with the values returned by create and checkpoint. Restore keeps the checkpoint's image and workspace size; `--cpu`, `--memory`, and `--timeout` configure the new container. A retained checkpoint remains available after its source sandbox is deleted. The `run` command returns the guest command's exit status, capped at 125.
 
 ## Runtime capabilities
 

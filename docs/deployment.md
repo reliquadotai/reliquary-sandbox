@@ -6,7 +6,7 @@ Run the controller on a dedicated Linux Docker host. The controller has access t
 
 The Compose controller runs as root to access the root-owned Docker socket. Its root filesystem is read-only, capabilities are dropped, and mutable service state lives in the `state` volume. These controller container settings do not reduce the authority granted by the Docker socket.
 
-The guest image runs as UID 1000. The runtime supplies writable `/workspace` and `/tmp` mounts, a read-only root filesystem, and configured resource bounds. Guest images must contain Python 3 and `/bin/bash` and must support the configured guest UID. Build images before adding their immutable image references to the approved image list.
+The guest image runs as UID 1000. The runtime supplies writable `/workspace` and `/tmp` mounts, a read-only root filesystem, and configured resource bounds. Guest images must contain Python 3 at `/usr/local/bin/python3` and `/bin/bash` and must support the configured guest UID. Build images before adding their immutable image references to the approved image list.
 
 ## Remote clients
 
@@ -48,12 +48,18 @@ All controller settings use the `RELIQUARY_SANDBOX_` prefix. Lists and mappings 
 | `GATEWAY_TOKEN_SECONDS` | `900` | Gateway credential lifetime |
 | `MAX_CHECKPOINTS_PER_TENANT` | `64` | Stored checkpoint count limit |
 | `REAPER_INTERVAL_SECONDS` | `5` | Expiry reconciliation interval |
+| `RETENTION_DAYS` | `7` | Maximum terminal lifecycle history age |
+| `MAX_TERMINAL_RECORDS_PER_TENANT` | `1000` | Maximum retained terminal lifecycle records |
 
 CPU, memory, disk, and lifetime requests must fit the deployment's configured bounds. `/workspace` is a RAM-backed tmpfs charged to the container memory limit. Its requested size is an upper bound; requesting a 5 GiB workspace does not give a 1 GiB container additional memory or an independent disk.
 
 ## State and upgrades
 
 Persist and back up the controller state volume. Checkpoints capture regular files inside `/workspace`, within the configured size and entry limits. They do not capture running processes, memory, installed system packages, or `/tmp`. A sandbox deletion removes the live guest; retained workspace checkpoints can be restored into another guest.
+
+Creation idempotency is scoped to a tenant and its supplied key. Reusing a key with different parameters returns a conflict. Terminal sandbox history, including completed creation keys, is retained for up to seven days and the newest 1,000 terminal records per tenant. A key can create a new sandbox after its prior record is pruned. Checkpoints have their own count quota and remain until explicitly deleted. Resources awaiting runtime cleanup remain tracked and count toward active quotas.
+
+Each state volume has a private runtime ownership identity. Keep that identity with the database when restoring a controller; separate state volumes can share a Docker host without reconciling each other's guests. Run one controller process per state volume. Concurrent commands or file operations on the same sandbox return a busy conflict; use separate sandboxes for parallel evaluations.
 
 Finish file-writing work before creating a checkpoint. The archive copies workspace files without freezing background processes; it does not promise a consistent application snapshot while independent writers are active.
 

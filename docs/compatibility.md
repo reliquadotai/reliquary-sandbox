@@ -8,6 +8,8 @@ The self-hosted service implements a bounded container runtime. `SandboxClient` 
 
 Lifecycle requests preserve the SDK JSON models, field aliases, sandbox statuses, checkpoint states, and batch lookup response shapes. File operations use the SDK's authenticated gateway paths. Commands use the binary Connect RPC `command_session.CommandSession/Start` method and the generated protobuf event models. Both synchronous and asynchronous SDK execution use this command transport.
 
+Command responses preserve stdout, stderr, and the guest exit code. Exceeding the captured-output limit produces a protocol error instead of a successful partial response. Command timeouts remove the sandbox; subsequent work requires a new sandbox or a checkpoint restore. The JSON command endpoint also reports explicit timeout and truncation flags.
+
 Workspace checkpoints preserve files only. `DURABLE` means the bounded archive is persisted in the controller's state directory; it does not mean a process or VM checkpoint exists. Restore requires the state volume and the original approved guest image to remain available.
 
 Authenticated `GET /api/v1/capabilities` reports the runtime's available operations and configured bounds. Authenticated `GET /api/v1/openapi.json` returns the current REST schema. `/health` checks the controller process and `/readyz` checks the configured runtime.

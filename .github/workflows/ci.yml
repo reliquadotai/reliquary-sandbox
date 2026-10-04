@@ -51,7 +51,7 @@ jobs:
           RUN_SANDBOX_LIVE: "1"
         run: uv run pytest -q -m live tests/test_live.py
       - name: Build controller image
-        run: docker compose build
+        run: docker build --target controller -t reliquary-sandbox-controller:0.1.0 .
       - name: Start Compose deployment
         run: |
           umask 077
@@ -65,4 +65,7 @@ jobs:
           curl --fail --silent http://127.0.0.1:8000/readyz
       - name: Stop Compose deployment
         if: always()
-        run: docker compose down --volumes
+        run: |
+          if [ -f .env ]; then
+            docker compose down --volumes
+          fi
