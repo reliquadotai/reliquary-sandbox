@@ -168,7 +168,7 @@ def create_app(settings=None, runtime=None):
         return state["manager"]
 
     def tenant(authorization: Annotated[str | None, Header()] = None):
-        supplied = authorization.removeprefix("Bearer ") if authorization else ""
+        supplied = authorization[7:] if authorization and authorization.startswith("Bearer ") else ""
         matched = None
         for name, token in settings.tokens.items():
             if hmac.compare_digest(supplied.encode(), token.encode()):
@@ -180,17 +180,21 @@ def create_app(settings=None, runtime=None):
     Tenant = Annotated[str, Depends(tenant)]
 
     def gateway(tenant_name, sandbox_id, authorization):
-        token = authorization.removeprefix("Bearer ") if authorization else ""
+        token = authorization[7:] if authorization and authorization.startswith("Bearer ") else ""
         try:
+            if len(token) > 4096:
+                raise ValueError
             claims, signature = token.split(".", 1)
             secret = settings.tokens[tenant_name]
             expected = hmac.new(secret.encode(), claims.encode(), hashlib.sha256).hexdigest()
-            value = json.loads(base64.urlsafe_b64decode(claims + "=" * (-len(claims) % 4)))
-            if not hmac.compare_digest(signature, expected) or value != {
-                "tenant": tenant_name, "sandbox": sandbox_id, "exp": value.get("exp")
-            } or not isinstance(value["exp"], int) or value["exp"] <= time.time():
+            if not hmac.compare_digest(signature, expected):
                 raise ValueError
-        except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+            value = json.loads(base64.urlsafe_b64decode(claims + "=" * (-len(claims) % 4)))
+            if not isinstance(value, dict) or value != {
+                "tenant": tenant_name, "sandbox": sandbox_id, "exp": value.get("exp")
+            } or type(value["exp"]) is not int or value["exp"] <= time.time():
+                raise ValueError
+        except (ValueError, KeyError, TypeError, UnicodeDecodeError):
             raise HTTPException(401, "valid sandbox token required") from None
         manager().owned(tenant_name, sandbox_id, running=True)
 
@@ -409,6 +413,8 @@ def create_app(settings=None, runtime=None):
                         yield _event(**{stream: data[start:start + 65536]})
                 if result.get("timed_out"):
                     yield _frame(json.dumps({"error": {"code": "deadline_exceeded", "message": "command timeout"}}).encode(), 2)
+                elif result.get("truncated"):
+                    yield _frame(json.dumps({"error": {"code": "resource_exhausted", "message": "command output limit exceeded"}}).encode(), 2)
                 else:
                     yield _event(exit_code=result["exit_code"])
                     yield _frame(b"{}", 2)

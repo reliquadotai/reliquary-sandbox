@@ -37,6 +37,8 @@ class Settings(BaseSettings):
     reaper_interval_seconds: float = Field(default=5, ge=0.1)
     gateway_token_seconds: int = Field(default=900, ge=60, le=3600)
     max_checkpoints_per_tenant: int = Field(default=64, ge=1)
+    retention_days: int = Field(default=7, ge=1, le=365)
+    max_terminal_records_per_tenant: int = Field(default=1000, ge=1)
 
     @field_validator("tokens")
     @classmethod

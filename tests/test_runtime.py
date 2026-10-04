@@ -41,6 +41,7 @@ class Client:
     def __init__(self):
         self.container = Container()
         self.creation = None
+        self.registry = {}
         self.available_images = {"guest:local"}
         self.server_info = {"OSType": "linux", "Runtimes": {"runsc": {}}}
         self.chunks = [(b"hello", b"warning")]
@@ -64,16 +65,31 @@ class Client:
 
     def create(self, **kwargs):
         self.creation = kwargs
+        if self.registry:
+            self.container = Container(kwargs["labels"][DockerRuntime.ID_LABEL])
         self.container.labels = kwargs["labels"]
+        self.registry[kwargs["name"]] = self.container
         return self.container
 
     def get(self, name):
-        if self.container.removed.is_set():
+        container = self.registry.get(name) if self.registry else self.container
+        if container is None or container.removed.is_set():
             raise NotFound("removed")
-        return self.container
+        return container
 
     def list(self, **kwargs):
-        return [] if self.container.removed.is_set() else [self.container]
+        labels = kwargs.get("filters", {}).get("label", [])
+        labels = [labels] if isinstance(labels, str) else labels
+        containers = list(self.registry.values()) if self.registry else [self.container]
+        return [
+            container
+            for container in containers
+            if not container.removed.is_set()
+            and all(
+                container.labels.get(key) == value
+                for key, value in (item.split("=", 1) for item in labels)
+            )
+        ]
 
     def exec_create(self, container_id, command, **kwargs):
         self.exec_arguments = (container_id, command, kwargs)
@@ -86,8 +102,9 @@ class Client:
 
 
 @pytest.fixture
-def settings():
+def settings(tmp_path):
     return SimpleNamespace(
+        state_dir=tmp_path / "state",
         docker_runtime="runsc",
         require_gvisor=True,
         default_image="guest:local",
@@ -107,7 +124,9 @@ def settings():
 
 @pytest.fixture
 def runtime(settings):
-    return DockerRuntime(settings, client=Client())
+    runtime = DockerRuntime(settings, client=Client())
+    runtime.client.container.labels[DockerRuntime.LABEL_NAMESPACE] = runtime._namespace
+    return runtime
 
 
 def test_creation_applies_isolation_and_resource_bounds(runtime):
@@ -127,6 +146,42 @@ def test_creation_applies_isolation_and_resource_bounds(runtime):
     assert "size=134217728" in config["tmpfs"]["/workspace"]
     assert config["log_config"]["Type"] == "none"
     assert "volumes" not in config and "mounts" not in config
+    assert config["command"][:4] == ["/usr/local/bin/python3", "-I", "-S", "-u"]
+    assert config["command"][-1] == "import time; time.sleep(7200.0)"
+
+
+def test_namespace_is_private_and_stable_across_restarts(runtime):
+    restarted = DockerRuntime(runtime.settings, client=runtime.client)
+    assert restarted._namespace == runtime._namespace
+    assert restarted._name("test") == runtime._name("test")
+    assert runtime.settings.state_dir.stat().st_mode & 0o777 == 0o700
+    assert (runtime.settings.state_dir / ".runtime-owner").stat().st_mode & 0o777 == 0o600
+
+
+def test_controllers_share_daemon_without_sharing_containers(settings, tmp_path):
+    client = Client()
+    first = DockerRuntime(settings, client=client)
+    first.create("first", {})
+    first_container = client.container
+    second_settings = SimpleNamespace(**vars(settings))
+    second_settings.state_dir = tmp_path / "other-state"
+    second = DockerRuntime(second_settings, client=client)
+    second.create("second", {})
+    second_container = client.container
+    assert set(first.managed_sandboxes()) == {"first"}
+    assert set(second.managed_sandboxes()) == {"second"}
+    first.delete("second")
+    second.delete("first")
+    assert not first_container.removed.is_set()
+    assert not second_container.removed.is_set()
+    first.delete("first")
+    assert first_container.removed.is_set()
+    assert not second_container.removed.is_set()
+
+
+def test_create_uses_requested_finite_guest_lifetime(runtime):
+    runtime.create("test", {"timeout_minutes": 1.5})
+    assert runtime.client.creation["command"][-1] == "import time; time.sleep(90.0)"
 
 
 @pytest.mark.parametrize(
@@ -157,6 +212,10 @@ def test_readiness_requires_images_present_locally(runtime):
         {"disk_size_gb": 100},
         {"cpu_cores": float("nan")},
         {"memory_gb": 0},
+        {"timeout_minutes": 0},
+        {"timeout_minutes": -1},
+        {"timeout_minutes": 121},
+        {"timeout_minutes": float("inf")},
     ],
 )
 def test_invalid_request_never_creates_a_container(runtime, spec):

@@ -9,8 +9,11 @@ from pathlib import Path
 class Store:
     def __init__(self, directory: Path):
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        directory.chmod(0o700)
         self.lock = threading.RLock()
-        self.db = sqlite3.connect(directory / "state.sqlite3", check_same_thread=False)
+        database = directory / "state.sqlite3"
+        self.db = sqlite3.connect(database, check_same_thread=False)
+        database.chmod(0o600)
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.executescript("""
@@ -74,6 +77,27 @@ class Store:
     def delete_checkpoint(self, tenant, checkpoint_id):
         with self.lock, self.db:
             self.db.execute("DELETE FROM checkpoints WHERE id=? AND tenant=?", (checkpoint_id, tenant))
+
+    def prune_terminal(self, cutoff, maximum):
+        """Bound completed history without discarding resources awaiting cleanup."""
+        with self.lock, self.db:
+            rows = self.db.execute("SELECT id,tenant,payload FROM sandboxes").fetchall()
+            tenants = {}
+            removed = []
+            for sandbox_id, tenant, payload in rows:
+                record = json.loads(payload)
+                if record["status"] in {"PENDING", "PROVISIONING", "RUNNING"} or record.get("cleanup_pending"):
+                    continue
+                completed = record.get("terminated_at") or record["updated_at"]
+                if completed < cutoff:
+                    removed.append(sandbox_id)
+                else:
+                    tenants.setdefault(tenant, []).append((completed, sandbox_id))
+            for records in tenants.values():
+                records.sort(reverse=True)
+                removed.extend(sandbox_id for _, sandbox_id in records[maximum:])
+            self.db.executemany("DELETE FROM sandboxes WHERE id=?", ((sandbox_id,) for sandbox_id in removed))
+            return removed
 
     def close(self):
         with self.lock:

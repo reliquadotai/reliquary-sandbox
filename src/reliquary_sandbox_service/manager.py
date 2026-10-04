@@ -5,7 +5,8 @@ import json
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException
 from pydantic import ConfigDict, Field
@@ -43,27 +44,69 @@ class Manager:
 
     def operation_lock(self, sandbox_id):
         with self.lock:
+            if self.store.get(sandbox_id) is None:
+                raise HTTPException(404, "sandbox not found")
             return self.operation_locks.setdefault(sandbox_id, threading.RLock())
 
+    @contextmanager
+    def operation(self, tenant, sandbox_id):
+        with self.lock:
+            self.owned(tenant, sandbox_id)
+            operation = self.operation_lock(sandbox_id)
+            if not operation.acquire(blocking=False):
+                raise HTTPException(409, "sandbox is busy")
+        try:
+            yield
+        finally:
+            operation.release()
+
     def owned(self, tenant, sandbox_id, running=False):
-        record = self.store.get(sandbox_id)
-        if not record or record["tenant"] != tenant:
-            raise HTTPException(404, "sandbox not found")
-        if running and record["status"] != "RUNNING":
-            raise HTTPException(409, "sandbox is not running")
-        return record
+        with self.lock:
+            record = self.store.get(sandbox_id)
+            if not record or record["tenant"] != tenant:
+                raise HTTPException(404, "sandbox not found")
+            if running:
+                if record["status"] != "RUNNING" or record.get("cleanup_pending"):
+                    raise HTTPException(409, "sandbox is not running")
+                now = time.time()
+                expired = now >= record["expires_at"]
+                idle = record.get("idle_timeout_minutes")
+                operation = self.operation_locks.get(sandbox_id)
+                acquired = operation.acquire(blocking=False) if operation else True
+                try:
+                    idle_expired = acquired and idle and now - record["last_activity"] >= idle * 60
+                    if expired or idle_expired:
+                        self.terminate(tenant, sandbox_id, "TIMEOUT", "lifetime expired" if expired else "idle timeout")
+                        raise HTTPException(409, "sandbox lifetime or idle deadline expired")
+                finally:
+                    if operation and acquired:
+                        operation.release()
+            return record
+
+    def prune_history(self):
+        with self.lock:
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=self.settings.retention_days)).isoformat()
+            self.store.prune_terminal(cutoff, self.settings.max_terminal_records_per_tenant)
+            known = {record["id"] for record in self.store.all()}
+            for sandbox_id, operation in list(self.operation_locks.items()):
+                if sandbox_id not in known and operation.acquire(blocking=False):
+                    operation.release()
+                    del self.operation_locks[sandbox_id]
 
     @staticmethod
     def view(record):
         return {key: value for key, value in record.items() if key not in {
             "tenant", "request_hash", "idempotency_key", "container_id", "last_activity",
             "expires_at", "request", "parent_checkpoint_id",
+            "cleanup_pending",
+            "cleanup_status", "cleanup_reason",
         }}
 
     def create(self, tenant, request):
         payload = request.model_dump(mode="json", exclude_none=True)
         digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
         with self.lock:
+            self.prune_history()
             previous = self.store.idempotent(tenant, request.idempotency_key)
             if previous:
                 if previous["request_hash"] != digest:
@@ -92,7 +135,7 @@ class Manager:
                 snapshot = checkpoint[1]
             payload.setdefault("docker_image", self.settings.default_image)
             payload.setdefault("disk_size_gb", 5)
-            active = [r for r in self.store.all(tenant) if r["status"] in ACTIVE]
+            active = [r for r in self.store.all(tenant) if r["status"] in ACTIVE or r.get("cleanup_pending")]
             if (len(active) >= self.settings.max_sandboxes_per_tenant
                 or sum(r["cpu_cores"] for r in active) + request.cpu_cores > self.settings.max_cpu_per_tenant
                 or sum(r["memory_gb"] for r in active) + request.memory_gb > self.settings.max_memory_gb_per_tenant):
@@ -119,12 +162,14 @@ class Manager:
                 record.update(status="RUNNING", started_at=timestamp(), updated_at=timestamp())
                 self.store.save(record)
             except Exception as exc:
+                cleanup_pending = False
                 try:
                     self.runtime.delete(sandbox_id)
                 except Exception:
-                    pass
-                record.update(status="ERROR", error_type="PROVISIONING_FAILED", error_message="runtime provisioning failed", updated_at=timestamp())
+                    cleanup_pending = True
+                record.update(status="ERROR", cleanup_pending=cleanup_pending, error_type="PROVISIONING_FAILED", error_message="runtime provisioning failed", updated_at=timestamp())
                 self.store.save(record)
+                self.prune_history()
                 if isinstance(exc, ValueError):
                     raise HTTPException(422, "request exceeds runtime limits or uses an unavailable image") from exc
                 raise HTTPException(503, "sandbox runtime unavailable") from exc
@@ -134,17 +179,24 @@ class Manager:
         # Deletion can interrupt an execution; the runtime removes all guest processes.
         with self.lock:
             record = self.owned(tenant, sandbox_id)
-            if record["status"] in ACTIVE:
+            if record["status"] in ACTIVE or record["status"] == "ERROR" or record.get("cleanup_pending"):
                 try:
                     self.runtime.delete(sandbox_id)
                 except Exception as exc:
+                    record.update(status="ERROR", cleanup_pending=True, cleanup_status=status,
+                                  cleanup_reason=reason, error_type="CLEANUP_FAILED",
+                                  error_message="runtime cleanup pending", updated_at=timestamp())
+                    self.store.save(record)
                     raise HTTPException(503, "runtime cleanup unavailable") from exc
-                record.update(status=status, termination_reason=reason, terminated_at=timestamp(), updated_at=timestamp())
+                record.update(status=status, cleanup_pending=False, termination_reason=reason, terminated_at=timestamp(), updated_at=timestamp())
+                record.pop("cleanup_status", None)
+                record.pop("cleanup_reason", None)
                 self.store.save(record)
+                self.prune_history()
             return {"success": True, "id": sandbox_id}
 
     def execute(self, tenant, sandbox_id, command, timeout, cwd=None, env=None):
-        with self.operation_lock(sandbox_id):
+        with self.operation(tenant, sandbox_id):
             with self.lock:
                 record = self.owned(tenant, sandbox_id, running=True)
                 remaining = record["expires_at"] - time.time()
@@ -159,6 +211,7 @@ class Manager:
             except ValueError as exc:
                 raise HTTPException(422, "invalid guest command options") from exc
             except Exception as exc:
+                self._failed_operation(tenant, sandbox_id)
                 raise HTTPException(503, "guest command unavailable") from exc
             with self.lock:
                 record = self.owned(tenant, sandbox_id)
@@ -167,10 +220,12 @@ class Manager:
                 if result.get("timed_out"):
                     record.update(status="TIMEOUT", termination_reason="command timeout", terminated_at=timestamp())
                 self.store.save(record)
+                if result.get("timed_out"):
+                    self.prune_history()
             return result
 
     def file(self, tenant, sandbox_id, path, data=None):
-        with self.operation_lock(sandbox_id):
+        with self.operation(tenant, sandbox_id):
             self.owned(tenant, sandbox_id, running=True)
             try:
                 result = self.runtime.download(sandbox_id, path) if data is None else self.runtime.upload(sandbox_id, path, data)
@@ -178,6 +233,9 @@ class Manager:
                 raise HTTPException(404, "file not found") from exc
             except ValueError as exc:
                 raise HTTPException(422, "invalid file path or size") from exc
+            except Exception as exc:
+                self._failed_operation(tenant, sandbox_id)
+                raise HTTPException(503, "guest filesystem unavailable") from exc
             with self.lock:
                 record = self.owned(tenant, sandbox_id)
                 record["last_activity"] = time.time()
@@ -185,7 +243,7 @@ class Manager:
             return result
 
     def checkpoint(self, tenant, sandbox_id):
-        with self.operation_lock(sandbox_id), self.lock:
+        with self.operation(tenant, sandbox_id), self.lock:
             record = self.owned(tenant, sandbox_id, running=True)
             if len(self.store.checkpoints(tenant)) >= self.settings.max_checkpoints_per_tenant:
                 raise HTTPException(429, "checkpoint quota exceeded")
@@ -193,6 +251,9 @@ class Manager:
                 snapshot = self.runtime.export_workspace(sandbox_id)
             except ValueError as exc:
                 raise HTTPException(422, "workspace exceeds checkpoint limits") from exc
+            except Exception as exc:
+                self._failed_operation(tenant, sandbox_id)
+                raise HTTPException(503, "guest checkpoint unavailable") from exc
             if len(snapshot) > self.settings.max_snapshot_bytes:
                 raise HTTPException(422, "workspace exceeds checkpoint limits")
             now = timestamp()
@@ -207,6 +268,16 @@ class Manager:
             self.store.save_checkpoint(tenant, payload, snapshot)
             return payload
 
+    def _failed_operation(self, tenant, sandbox_id):
+        with self.lock:
+            record = self.owned(tenant, sandbox_id)
+            record.update(status="ERROR", cleanup_pending=True, error_type="RUNTIME_OPERATION_FAILED", error_message="runtime operation failed", updated_at=timestamp())
+            self.store.save(record)
+            try:
+                self.terminate(tenant, sandbox_id, "ERROR", "runtime operation failed")
+            except HTTPException:
+                pass
+
     def reconcile(self):
         with self.lock:
             managed = self.runtime.managed_sandboxes()
@@ -219,11 +290,21 @@ class Manager:
                     self.runtime.delete(record["id"])
                     record.update(status="ERROR", error_type="RUNTIME_STOPPED", error_message="runtime stopped", updated_at=timestamp(), terminated_at=timestamp())
                     self.store.save(record)
+                elif record.get("cleanup_pending"):
+                    self.terminate(record["tenant"], record["id"], record.get("cleanup_status", record["status"]), record.get("cleanup_reason", "runtime cleanup"))
+            self.prune_history()
 
     def reap(self):
         with self.lock:
             now = time.time()
+            failure = None
             for record in self.store.all():
+                if record.get("cleanup_pending"):
+                    try:
+                        self.terminate(record["tenant"], record["id"], record.get("cleanup_status", record["status"]), record.get("cleanup_reason", "runtime cleanup"))
+                    except HTTPException as exc:
+                        failure = exc
+                    continue
                 if record["status"] not in ACTIVE:
                     continue
                 idle = record.get("idle_timeout_minutes")
@@ -235,6 +316,11 @@ class Manager:
                     idle_expired = acquired and idle and now - record["last_activity"] >= idle * 60
                     if expired or idle_expired:
                         self.terminate(record["tenant"], record["id"], "TIMEOUT", "lifetime expired" if expired else "idle timeout")
+                except HTTPException as exc:
+                    failure = exc
                 finally:
                     if acquired:
                         lock.release()
+            self.prune_history()
+            if failure:
+                raise RuntimeError("runtime cleanup incomplete") from failure

@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import base64
 import math
+import os
 import re
+import stat
 import threading
 import time
 import uuid
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import docker
@@ -173,9 +175,16 @@ class DockerRuntime:
 
     LABEL = "reliquary.sandbox.managed"
     ID_LABEL = "reliquary.sandbox.id"
+    LABEL_NAMESPACE = "reliquary.sandbox.namespace"
 
     def __init__(self, settings: Any, *, client: Any = None):
         self.settings = settings
+        try:
+            self._namespace = self._load_namespace()
+        except RuntimeUnavailable:
+            raise
+        except (OSError, ValueError, UnicodeError) as exc:
+            raise RuntimeUnavailable("Runtime ownership state is unavailable") from exc
         self.client = client or docker.DockerClient(
             base_url=getattr(settings, "docker_host", None),
             timeout=getattr(settings, "docker_connect_timeout", 10),
@@ -183,6 +192,50 @@ class DockerRuntime:
 
     def _get(self, name: str, default: Any) -> Any:
         return getattr(self.settings, name, default)
+
+    def _load_namespace(self) -> str:
+        directory = Path(self._get("state_dir", Path("data")))
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            info = os.fstat(descriptor)
+            if info.st_uid != os.geteuid():
+                raise RuntimeUnavailable("Runtime state directory ownership is invalid")
+            os.fchmod(descriptor, 0o700)
+            try:
+                owner = os.open(
+                    ".runtime-owner",
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=descriptor,
+                )
+            except FileExistsError:
+                pass
+            else:
+                with os.fdopen(owner, "w", encoding="ascii") as output:
+                    output.write(uuid.uuid4().hex + "\n")
+                    output.flush()
+                    os.fsync(output.fileno())
+                os.fsync(descriptor)
+            owner = os.open(
+                ".runtime-owner",
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=descriptor,
+            )
+            with os.fdopen(owner, "r", encoding="ascii") as source:
+                info = os.fstat(source.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+                    raise RuntimeUnavailable("Runtime ownership state is invalid")
+                os.fchmod(source.fileno(), 0o600)
+                namespace = source.read(65).strip()
+            if not re.fullmatch(r"[0-9a-f]{32}", namespace):
+                raise RuntimeUnavailable("Runtime ownership state is invalid")
+            return namespace
+        finally:
+            os.close(descriptor)
+
+    def _name(self, sandbox_id: str) -> str:
+        return "sandbox-" + self._namespace + "-" + sandbox_id
 
     def readiness(self) -> dict[str, Any]:
         try:
@@ -234,11 +287,27 @@ class DockerRuntime:
         uid = int(self._get("default_uid", 1000))
         if uid <= 0:
             raise ValueError("The guest user must be nonroot")
+        maximum_lifetime = float(self._get("max_timeout_minutes", 120))
+        requested_lifetime = spec.get("timeout_minutes")
+        lifetime = maximum_lifetime if requested_lifetime is None else float(requested_lifetime)
+        if not math.isfinite(lifetime) or lifetime <= 0 or lifetime > maximum_lifetime:
+            raise ValueError("Sandbox lifetime exceeds the configured resource range")
         container = self.client.containers.create(
             image=approved_image.id,
-            command=["python3", "-u", "-c", "import time; time.sleep(2147483647)"],
-            name="sandbox-" + sandbox_id,
-            labels={self.LABEL: "true", self.ID_LABEL: sandbox_id},
+            command=[
+                "/usr/local/bin/python3",
+                "-I",
+                "-S",
+                "-u",
+                "-c",
+                "import time; time.sleep(" + repr(lifetime * 60) + ")",
+            ],
+            name=self._name(sandbox_id),
+            labels={
+                self.LABEL: "true",
+                self.ID_LABEL: sandbox_id,
+                self.LABEL_NAMESPACE: self._namespace,
+            },
             runtime=self._get("docker_runtime", "runsc"),
             user=f"{uid}:{uid}",
             working_dir="/workspace",
@@ -284,10 +353,11 @@ class DockerRuntime:
     def _container(self, sandbox_id: str) -> Any:
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", sandbox_id):
             raise ValueError("Invalid sandbox identifier")
-        container = self.client.containers.get("sandbox-" + sandbox_id)
+        container = self.client.containers.get(self._name(sandbox_id))
         if (
             container.labels.get(self.LABEL) != "true"
             or container.labels.get(self.ID_LABEL) != sandbox_id
+            or container.labels.get(self.LABEL_NAMESPACE) != self._namespace
         ):
             raise RuntimeOperationError("Container ownership does not match the sandbox")
         return container
@@ -296,9 +366,13 @@ class DockerRuntime:
         return {
             item.labels[self.ID_LABEL]: item.id
             for item in self.client.containers.list(
-                all=True, filters={"label": self.LABEL + "=true"}
+                all=True,
+                filters={
+                    "label": [self.LABEL + "=true", self.LABEL_NAMESPACE + "=" + self._namespace]
+                },
             )
             if self.ID_LABEL in item.labels
+            and item.labels.get(self.LABEL_NAMESPACE) == self._namespace
         }
 
     def status(self, sandbox_id: str) -> str:
