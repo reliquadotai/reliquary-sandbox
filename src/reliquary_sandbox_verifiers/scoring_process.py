@@ -31,6 +31,19 @@ own bytes, never the child's). The child
   (what it maps plus `memory_bytes`; soft = hard, so the env's code cannot raise it
   back), RLIMIT_FSIZE (`file_bytes`: a file past it fails with EFBIG, SIGXFSZ ignored)
   and, on its own uid, RLIMIT_NPROC (`nproc`);
+* installs an audit hook (`_install_audit_guard`, `sys.addaudithook`: it cannot be
+  removed) that refuses, from then on, what turns the agent's bytes into code or a
+  process: `exec`, `compile` (but `ast.parse`, which only builds a tree, and
+  `typing.ForwardRef` resolving a string annotation of the env's source), `code.__new__`,
+  `marshal.loads` / `marshal.load`, `pickle.find_class` (so no unpickling of anything
+  but builtin containers and scalars), every `ctypes.*` event, `subprocess.Popen`,
+  `os.system`, `os.exec*`, `os.posix_spawn*`, `os.spawn*`, `os.fork` and `os.forkpty`.
+  An import still loads its files: `exec`, `compile`, `marshal.loads`, `code.__new__`
+  and `ctypes.*` are let through while importlib runs a module of the env's
+  installation (`dataclasses`, `namedtuple` and the like at module level included); a
+  process, `pickle.find_class` and string code outside an import never are. A refusal
+  raises PermissionError where it happened and is remembered: whatever the env's code
+  then does (catches it, returns a reward), the hook's result is `raised` (graded 0);
 * says `ready`, then runs the hook (`Task.score`, or `setup` / `grading_setup` /
   `finalize` through verifiers' `invoke`) on its own event loop;
 
@@ -55,7 +68,9 @@ contents and a command's stdout/stderr as raw bytes after the header (their leng
 it), never JSON-escaped: no header bound trips on a command's output. An error of a parent call is handed back as the nearest builtin
 exception (an `OSError` keeps its errno), tagged with the call's id, so the env's
 `except OSError` works and the parent can tell which of its own exceptions the env let
-through.
+through. The parent checks every reply it sends against what the child reads
+(`_reply_problem`): a reply of ours the child could not read ends the scoring as ours
+before it is sent.
 
 Who is to blame when no result comes back (`ScoringOutcome.kind`):
 
@@ -67,30 +82,36 @@ Who is to blame when no result comes back (`ScoringOutcome.kind`):
 * `died` (graded 0 `grading_timeout`: the agent's bytes drove the env's code there):
   after `ready`, killed by the watchdog at the deadline, past RLIMIT_CPU
   (SIGXCPU/SIGKILL) or RLIMIT_AS (MemoryError), or any other end that is not ours (a
-  crash in the env's native code, the env's code exiting);
+  crash in the env's native code, the env's code exiting), EXIT_OURS and EXIT_PROTOCOL
+  included: after `ready` the child runs code the agent's bytes steer, which can exit
+  with any code, so only what the parent itself detects is ours;
 * `raised` (graded 0 `grading_failed`): after `ready`, anything that escapes the
   scoring's run, not only what `Task.score` (or the hook) raises (the env's code stopping the event
-  loop, SystemExit);
+  loop, SystemExit), and any event the audit hook refused;
 * `ours` (`aborted`): the process could not be started (pickling the task, the
   forkserver, its wrapper, an unprivileged controller, no free slot, its TMPDIR), or
   ended before `ready` for any reason (an import of the env's module failed, our setup
   failed, the host killed it), or was not ready within its ready limit
   (`ready_s`, 120 s by default: an import too slow), or the forkserver it came from
-  died while it scored (a host OOM kill), or it exited with EXIT_OURS / EXIT_PROTOCOL
-  (after `ready`: our send of the result failed, or it could not read a reply of the
-  parent). A broken message the CHILD sends stays `broken` (graded 0): after `ready`
-  the child runs code the agent's bytes steer.
+  died while it scored (a host OOM kill), or the parent was about to send a reply the
+  child could not read. A broken message the CHILD sends stays `broken` (graded 0):
+  after `ready` the child runs code the agent's bytes steer.
 
-Residual (code execution in the scoring process): code that runs there can exit with
-EXIT_OURS (70) or EXIT_PROTOCOL (71) itself after `ready`, which voids its episode
-(`aborted`) instead of grading it 0, and it can forge its result (the result is the
-child's word). Reward integrity against code execution in the scoring process is out
-of scope; what is defended is isolation: no secret, no root, no network, no other
-episode.
+Residual (code execution in the scoring process): the audit hook takes the usual ways
+from data to code away from a parser (eval/exec of a string, unpickling, marshal,
+ctypes, a process), not a deserializer that calls arbitrary callables with arguments
+it builds (PyYAML's unsafe loaders: `python/object/apply` reaches, for example,
+`os.write` on the pipe, which no audit event covers). Such code can still forge its
+result (the result is the child's word). The conformance suite therefore refuses an env
+package that imports math_verify, sympy, latex2sympy2, pickle (or dill, cloudpickle,
+shelve, marshal) or uses an unsafe PyYAML loader (`conformance.unsafe_imports`). What
+is enforced whatever runs: isolation (no secret, no root, no network, no other
+episode), and no exit code of the child after `ready` voids its episode.
 """
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import builtins
 import ctypes
@@ -109,6 +130,7 @@ import sys
 import tempfile
 import threading
 import time
+import typing
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from multiprocessing.connection import Connection
@@ -187,6 +209,29 @@ THREAD_VARS = ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS")
 """Kept from the wrapper's environment (each "1"): math libraries run on one thread."""
 KILL_ROUNDS = 50
 """The sweeper signals its uid's processes until none is left, at most this many times."""
+REFUSED_EVENTS = frozenset({
+    "exec", "compile", "code.__new__", "marshal.loads", "marshal.load", "pickle.find_class",
+    "subprocess.Popen", "os.system", "os.exec", "os.posix_spawn", "os.spawn", "os.fork",
+    "os.forkpty"})
+"""Audit events a scoring process refuses once it is about to be ready (besides every
+`ctypes.*` event): from the agent's bytes to code (string source, code objects,
+marshal, unpickling a global, foreign calls) or to a process."""
+REFUSED_PREFIX = "ctypes."
+IMPORT_EVENTS = frozenset({"exec", "compile", "code.__new__", "marshal.loads"})
+"""Refused events an import needs to load the env's files (a `.pyc`, a `.py`, the
+`exec` of the module, `dataclasses` and `namedtuple` at module level): let through
+while importlib runs, along with `ctypes.*` (a module that loads its library)."""
+IMPORT_FRAMES = ("<frozen importlib._bootstrap>", "<frozen importlib._bootstrap_external>",
+                 "<frozen zipimport>")
+"""The filenames of importlib's own frames (frozen: no file an env's code can replace)."""
+_AST_FILE = ast.__file__
+_TYPING_FILE = typing.__file__
+TYPING_CODE = frozenset({"__init__", "_evaluate"})
+"""`typing.ForwardRef` compiles (`__init__`) and evaluates (`_evaluate`) a string
+annotation of the env's source: let through (pydantic resolves a model's postponed
+annotations the first time it builds one, as the terminal env's `grading_setup` does)."""
+_REFUSED: list[str] = []
+"""The events the audit hook refused in this process (the first decides the result)."""
 
 
 @dataclass(frozen=True)
@@ -635,16 +680,58 @@ def _unprivileged(identity: ScoringIdentity, tmpdir: str) -> bool:
     return dedicated
 
 
+def _importing(frame: Any) -> bool:
+    """Whether importlib is running below `frame` (an import of the env's files)."""
+    while frame is not None:
+        if frame.f_code.co_filename in IMPORT_FRAMES:
+            return True
+        frame = frame.f_back
+    return False
+
+
+def _audit_guard(event: str, args: tuple[Any, ...]) -> None:
+    """The scoring process's audit hook (see the module docstring): PermissionError for a
+    refused event, remembered in _REFUSED."""
+    if event not in REFUSED_EVENTS and not event.startswith(REFUSED_PREFIX):
+        return
+    caller = sys._getframe(1)
+    if event == "compile" and caller.f_code.co_filename == _AST_FILE \
+            and caller.f_code.co_name == "parse":
+        return  # ast.parse: a tree, never code (compiling the tree again is refused)
+    if (event in ("compile", "exec") and caller.f_code.co_filename == _TYPING_FILE
+            and caller.f_code.co_name in TYPING_CODE):
+        return  # an annotation of the env's source, never the agent's bytes
+    if (event in IMPORT_EVENTS or event.startswith(REFUSED_PREFIX)) and _importing(caller):
+        return
+    _REFUSED.append(event)
+    raise PermissionError(f"the scoring process refuses {event!r}: no code or process "
+                          "from what the agent wrote")
+
+
+def _install_audit_guard() -> None:
+    """The audit hook, for the rest of this process (it cannot be removed)."""
+    sys.addaudithook(_audit_guard)
+
+
+def _refused_result(result: dict[str, Any]) -> dict[str, Any]:
+    """`raised` when the audit hook refused anything, whatever the hook returned."""
+    if not _REFUSED:
+        return result
+    return {"result": "raised", "type": "PermissionError",
+            "message": _text(f"the scoring process refused {_REFUSED[0]!r}"), "calls": []}
+
+
 def _child_main(conn: Connection, task_bytes: bytes, make_trace: Callable[[Any], Any],
                 view: dict[str, Any], deadline: float, memory_bytes: int,
                 identity: ScoringIdentity, tmpdir: str, hook: str) -> None:
     """Never returns: the child leaves with os._exit (no atexit, no inherited cleanup).
-    Before `ready` every failure is ours (EXIT_OURS). After it, only a failure of our
-    own send of the result is ours (EXIT_OURS); a MemoryError is the scoring's
-    (EXIT_MEMORY) and anything else escaping the scoring's run is the scoring's exit (a
-    `raised` result: graded 0). It drops its privileges before it imports the env's
-    module (the task's unpickling): the env's modules and task files must be readable
-    by `identity` (deployment)."""
+    Before `ready` every failure is ours (EXIT_OURS). After it, a failure of our own
+    send of the result exits EXIT_OURS (the parent grades it `died`: it cannot tell it
+    from the env's code exiting so), a MemoryError is the scoring's (EXIT_MEMORY) and
+    anything else escaping the scoring's run is the scoring's exit (a `raised` result:
+    graded 0; so is any event the audit hook refused). It drops its privileges before
+    it imports the env's module (the task's unpickling): the env's modules and task
+    files must be readable by `identity` (deployment)."""
     try:
         _close_inherited_fds(conn.fileno())
         signal.signal(signal.SIGXFSZ, signal.SIG_IGN)  # past RLIMIT_FSIZE: EFBIG, no kill
@@ -652,6 +739,7 @@ def _child_main(conn: Connection, task_bytes: bytes, make_trace: Callable[[Any],
         task = pickle.loads(task_bytes)
         trace = make_trace(task)
         _limit(deadline, memory_bytes, identity, dedicated)
+        _install_audit_guard()  # the last of our setup: nothing of the agent's ran yet
         conn.send_bytes(_frame({"ready": True}))
     except BaseException:
         os._exit(EXIT_OURS)
@@ -668,7 +756,7 @@ def _child_main(conn: Connection, task_bytes: bytes, make_trace: Callable[[Any],
         except BaseException:
             result = {"result": "raised", "type": "BaseException", "message": "", "calls": []}
     try:
-        conn.send_bytes(_frame(result))
+        conn.send_bytes(_frame(_refused_result(result)))
     except MemoryError:
         os._exit(EXIT_MEMORY)
     except BaseException:
@@ -864,12 +952,37 @@ async def _serve(conn: Connection, box: SandboxRuntime, max_message_bytes: int,
             except Exception as exc:  # handed to the env's code, kept for the verdict
                 errors[call_id] = exc
                 reply = _reply({"error": _describe(exc)})
+            problem = _reply_problem(op, reply)
+            if problem is not None:  # the child would exit EXIT_PROTOCOL: ours, not its
+                return ScoringOutcome("ours", detail=f"our reply to {op} is one the scoring "
+                                                     f"process cannot read ({problem})")
             try:
                 conn.send_bytes(reply)
             except OSError as exc:
                 return ScoringOutcome("died", detail=_text(exc))
     finally:
         loop.remove_reader(conn.fileno())
+
+
+def _reply_problem(op: str, reply: bytes) -> str | None:
+    """Why the child could not read `reply` to `op` (`_RemoteInner._call` and `run`
+    exit EXIT_PROTOCOL on it), or None. The parent checks its own replies so that a
+    protocol failure of ours is never the child's exit code to report."""
+    try:
+        header, data = _unframe(reply)
+    except ValueError as exc:
+        return _text(exc)
+    if "error" in header:
+        return None if isinstance(header["error"], dict) else "a malformed error"
+    if "value" not in header:
+        return "no value"
+    value = header["value"]
+    if op == "run" and not (
+            isinstance(value, dict) and isinstance(value.get("exit_code"), int)
+            and _int(value.get("stdout_bytes")) and _int(value.get("stderr_bytes"))
+            and value["stdout_bytes"] + value["stderr_bytes"] == len(data)):
+        return "a malformed run reply"
+    return None
 
 
 def _reply(header: dict[str, Any], payload: bytes = b"") -> bytes:
@@ -883,8 +996,10 @@ def _blame(outcome: ScoringOutcome, child: _Child, ready: bool,
     Ours: the forkserver it came from died (a host OOM kill took both; the agent's code
     runs unprivileged and cannot signal it), or it ended before `ready` whatever the
     cause (it ran only our code and the env's import; it started with at least
-    SCORING_STARTUP_FLOOR_S left), or it exited with one of our exit codes (after
-    `ready`, code that the agent's bytes steer can also exit with them: a residual)."""
+    SCORING_STARTUP_FLOOR_S left). After `ready` every end without a result is the
+    scoring's, EXIT_OURS and EXIT_PROTOCOL included: code the agent's bytes steer can
+    exit with them, and a protocol failure of ours is detected by the parent itself
+    (`_serve` returns `ours` before it sends a reply the child could not read)."""
     if outcome.kind != "died":
         return outcome
     code = child.exitcode
@@ -900,9 +1015,6 @@ def _blame(outcome: ScoringOutcome, child: _Child, ready: bool,
     if child.killed_at_deadline or code in LIMIT_SIGNALS or code == EXIT_MEMORY:
         return ScoringOutcome("died", detail=f"{outcome.detail}; exit code {code}, killed at "
                                              f"the deadline: {child.killed_at_deadline}")
-    if code in (EXIT_OURS, EXIT_PROTOCOL):
-        return ScoringOutcome("ours", detail=f"the scoring process failed in our code "
-                                             f"(exit code {code})")
     return ScoringOutcome("died", detail=f"{outcome.detail}; exit code {code}")
 
 

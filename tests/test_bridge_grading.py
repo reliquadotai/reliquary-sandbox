@@ -810,12 +810,32 @@ def test_a_scoring_process_whose_import_fails_is_ours(monkeypatch, caplog):
 
 
 def test_a_reply_the_scoring_process_cannot_read_is_ours(monkeypatch, caplog):
+    """The parent detects its own broken reply before sending it: ours, never the
+    child's EXIT_PROTOCOL (which is graded 0 after `ready`)."""
     episode = Episode()
     episode.agent_writes("/work/answer.txt", b"42\n")
     monkeypatch.setattr(scoring_process, "_reply", lambda header, payload=b"": b"\0\0\0\x09{")
     outcome = episode.grade()
     assert outcome.status == "aborted" and outcome.reward is None
-    assert f"exit code {scoring_process.EXIT_PROTOCOL}" in caplog.text
+    assert "is one the scoring process cannot read" in caplog.text
+
+
+@pytest.mark.parametrize("reply, problem", [
+    (scoring_process._frame({"value": None}), None),
+    (scoring_process._frame({"error": {"type": "OSError"}}), None),
+    (scoring_process._frame({"error": "x"}), "a malformed error"),
+    (scoring_process._frame({}), "no value"),
+    (b"\0\0\0\x09{", "truncated or oversized header"),
+    (scoring_process._frame({"value": {"exit_code": 0, "stdout_bytes": 2,
+                                       "stderr_bytes": 0}}, b"ok"), None),
+    (scoring_process._frame({"value": {"exit_code": 0, "stdout_bytes": 3,
+                                       "stderr_bytes": 0}}, b"ok"), "a malformed run reply"),
+    (scoring_process._frame({"value": {"exit_code": "0", "stdout_bytes": 0,
+                                       "stderr_bytes": 0}}), "a malformed run reply"),
+])
+def test_the_parent_checks_its_replies_as_the_child_reads_them(reply, problem):
+    op = "run" if b"exit_code" in reply else "exists"
+    assert scoring_process._reply_problem(op, reply) == problem
 
 
 def test_a_forkserver_that_cannot_start_is_ours(monkeypatch, caplog):
@@ -878,6 +898,172 @@ def test_a_scoring_failure_after_it_started_is_graded_zero_never_aborted(task_cl
     outcome = Episode(task_class).grade()
     assert (outcome.status, outcome.reward) == ("graded", 0.0)
     assert outcome.facts == {"_grader": {"agent_fault": fault}}
+
+
+# -- the audit hook: no code or process from the agent's bytes ------------------------
+
+FORGED = {"result": "scored", "rewards": {"solved": 1.0}, "metrics": {}, "reward": 1.0,
+          "reward_repr": "1.0"}
+FORGE = "conn.send_bytes(frame(forged))"
+"""What a parser exploited into running the agent's code would do: send a result of
+its own on the scoring process's pipe (the parent takes the first result it reads)."""
+
+
+def _forge_scope(runtime):
+    return {"conn": runtime.inner.conn, "frame": scoring_process._frame, "forged": FORGED}
+
+
+class ForgesThroughExec(ToyTask):
+    @vf.reward(weight=1.0)
+    async def solved(self, runtime) -> float:
+        exec(FORGE, _forge_scope(runtime))
+        return 0.0
+
+
+class ForgesThroughEval(ToyTask):
+    @vf.reward(weight=1.0)
+    async def solved(self, runtime) -> float:
+        eval(FORGE, _forge_scope(runtime))
+        return 0.0
+
+
+class ForgesThroughCompiledCode(ToyTask):
+    @vf.reward(weight=1.0)
+    async def solved(self, runtime) -> float:
+        import ast
+
+        exec(compile(ast.parse(FORGE), "<agent>", "exec"), _forge_scope(runtime))
+        return 0.0
+
+
+class ForgesAndSwallowsTheRefusal(ToyTask):
+    """An env that catches everything (`except Exception`) and returns a reward anyway:
+    the refusal is remembered, the result is `raised` whatever the env returns."""
+
+    @vf.reward(weight=1.0)
+    async def solved(self, runtime) -> float:
+        try:
+            exec(FORGE, _forge_scope(runtime))
+        except Exception:
+            pass
+        return 1.0
+
+
+class _Gadget:
+    def __reduce__(self):
+        return (os.system, ("true",))
+
+
+class UnpicklesTheAgentsBytes(ToyTask):
+    @vf.reward(weight=1.0)
+    async def solved(self, runtime) -> float:
+        import pickle
+
+        pickle.loads(pickle.dumps(_Gadget()))
+        return 1.0
+
+
+class UnmarshalsTheAgentsBytes(ToyTask):
+    @vf.reward(weight=1.0)
+    async def solved(self, runtime) -> float:
+        import marshal
+
+        marshal.loads(marshal.dumps(1))
+        return 1.0
+
+
+class CallsCtypes(ToyTask):
+    @vf.reward(weight=1.0)
+    async def solved(self, runtime) -> float:
+        import ctypes
+
+        ctypes.CDLL(None).getpid()
+        return 1.0
+
+
+class StartsAProcess(ToyTask):
+    @vf.reward(weight=1.0)
+    async def solved(self, runtime) -> float:
+        import subprocess
+
+        subprocess.run(["true"], check=False)
+        return 1.0
+
+
+class Forks(ToyTask):
+    @vf.reward(weight=1.0)
+    async def solved(self, runtime) -> float:
+        if os.fork() == 0:
+            os._exit(0)
+        return 1.0
+
+
+class RunsAShell(ToyTask):
+    @vf.reward(weight=1.0)
+    async def solved(self, runtime) -> float:
+        os.system("true")
+        return 1.0
+
+
+@pytest.mark.parametrize("task_class", [
+    ForgesThroughExec, ForgesThroughEval, ForgesThroughCompiledCode,
+    ForgesAndSwallowsTheRefusal, UnpicklesTheAgentsBytes, UnmarshalsTheAgentsBytes,
+    CallsCtypes, StartsAProcess, Forks, RunsAShell,
+], ids=["exec", "eval", "compile_ast", "swallowed", "pickle", "marshal", "ctypes",
+        "subprocess", "fork", "os_system"])
+def test_a_refused_event_in_the_scoring_process_grades_zero(task_class, caplog):
+    episode = Episode(task_class)
+    episode.agent_writes("/work/answer.txt", b"42\n")
+    outcome = episode.grade()
+    assert (outcome.status, outcome.reward) == ("graded", 0.0)
+    assert outcome.facts == {"_grader": {"agent_fault": "grading_failed"}}
+    assert "PermissionError" in caplog.text and "refuse" in caplog.text
+
+
+class ImportsAndParsesWhileScoring(ToyTask):
+    """What a reward legitimately does once ready: import a module not loaded yet
+    (its `.pyc` or `.py`, a dataclass and a namedtuple at its module level), read a
+    test file's tree (`ast.parse`), resolve a string annotation (`typing.ForwardRef`),
+    parse JSON and a regex."""
+
+    @vf.reward(weight=1.0)
+    async def solved(self, runtime) -> float:
+        import ast
+        import re
+        import typing
+
+        sys.modules.pop("lazy_scoring_module", None)
+        import lazy_scoring_module
+
+        ast.parse("def test_x():\n    assert True\n")
+        assert typing.get_type_hints(lazy_scoring_module.Annotated) == {"score": float}
+        json.loads('{"a": [1, 2]}')
+        answer = (await runtime.read("/work/out/answer.txt")).decode()
+        assert re.fullmatch(r"\d+\n", answer)
+        return lazy_scoring_module.verdict(answer + " done").score
+
+
+def test_imports_and_parsing_still_work_once_the_scoring_process_is_ready():
+    episode = Episode(ImportsAndParsesWhileScoring)
+    episode.agent_writes("/work/answer.txt", b"42\n")
+    outcome = episode.grade()
+    assert (outcome.status, outcome.reward) == ("graded", 1.0)
+
+
+class ExitsWithOurCode(ToyTask):
+    @vf.reward(weight=1.0)
+    async def solved(self, runtime) -> float:
+        os._exit(int(self.data.prompt))
+
+
+@pytest.mark.parametrize("code", [scoring_process.EXIT_OURS, scoring_process.EXIT_PROTOCOL])
+def test_our_exit_codes_after_ready_grade_zero_never_abort(code):
+    """After `ready` the child runs code the agent's bytes steer: it can exit with any
+    code, ours included; only what the parent detects itself is ours."""
+    episode = Episode(ExitsWithOurCode, data=toy_data(prompt=str(code)))
+    outcome = episode.grade()
+    assert (outcome.status, outcome.reward) == ("graded", 0.0)
+    assert outcome.facts == {"_grader": {"agent_fault": "grading_timeout"}}
 
 
 # -- fix round 3 ------------------------------------------------------------------------
@@ -1816,53 +2002,11 @@ def test_the_preload_check_imports_the_env_modules_as_the_forkserver_would(monke
 # The scoring process has no network. Verified live by the hostile env's live run
 # (as root).
 
-NET_PROBE = "/tmp/net-probe.json"
-
-
-class ProbesTheNetwork(ToyTask):
-    """Scores 1 only when every non-Unix socket family and io_uring are refused with
-    EPERM while Unix sockets work; writes what it saw to the box for the test."""
-
-    @vf.reward(weight=1.0)
-    async def solved(self, runtime) -> float:
-        import ctypes
-        import socket
-
-        seen = {}
-        for name in ("AF_INET", "AF_INET6", "AF_NETLINK", "AF_PACKET", "AF_VSOCK"):
-            try:
-                socket.socket(getattr(socket, name), socket.SOCK_DGRAM).close()
-                seen[name] = "opened"
-            except PermissionError:
-                seen[name] = "EPERM"
-            except OSError as exc:
-                seen[name] = f"errno {exc.errno}"
-        try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM):
-                pass
-            left, right = socket.socketpair()
-            left.sendall(b"x")
-            seen["AF_UNIX"] = "ok" if right.recv(1) == b"x" else "broken"
-            left.close()
-            right.close()
-        except OSError as exc:
-            seen["AF_UNIX"] = f"errno {exc.errno}"
-        libc = ctypes.CDLL(None, use_errno=True)
-        params = ctypes.create_string_buffer(120)  # struct io_uring_params
-        fd = libc.syscall(425, 1, params)  # io_uring_setup: 425 on x86_64 and aarch64
-        seen["io_uring"] = "EPERM" if fd < 0 and ctypes.get_errno() == 1 else f"{fd}"
-        if fd >= 0:
-            os.close(fd)
-        with open("/proc/self/status") as status:
-            seen["seccomp"] = [line.split()[1] for line in status
-                               if line.startswith("Seccomp:")][0]
-        await runtime.write(NET_PROBE, json.dumps(seen).encode())
-        refused = all(seen[name] == "EPERM" for name in
-                      ("AF_INET", "AF_INET6", "AF_NETLINK", "AF_PACKET", "AF_VSOCK"))
-        return 1.0 if refused and seen["AF_UNIX"] == "ok" and seen["io_uring"] == "EPERM" else 0.0
-
-
 def test_the_scoring_process_has_no_network_but_unix_sockets():
+    # Imported here, never at module level: its import turns the audit hook off in the
+    # scoring processes that unpickle its tasks (see its docstring).
+    from seccomp_probes import NET_PROBE, ProbesTheNetwork
+
     episode = Episode(ProbesTheNetwork)
     kept = grading_box_files(episode)
     outcome = episode.grade()
@@ -1874,29 +2018,9 @@ def test_the_scoring_process_has_no_network_but_unix_sockets():
     assert (outcome.status, outcome.reward) == ("graded", 1.0)
 
 
-class ProbesProcessReach(ToyTask):
-    """Scores 1 only when ptrace, process_vm_readv/writev and pidfd_getfd fail with EPERM
-    (with these arguments, unfiltered they fail with another errno or succeed)."""
-
-    @vf.reward(weight=1.0)
-    async def solved(self, runtime) -> float:
-        import ctypes
-        import platform
-
-        numbers = {"x86_64": (101, 310, 311, 438),
-                   "aarch64": (117, 270, 271, 438)}[platform.machine()]
-        libc = ctypes.CDLL(None, use_errno=True)
-        seen = {}
-        for name, nr in zip(("ptrace", "process_vm_readv", "process_vm_writev",
-                             "pidfd_getfd"), numbers):
-            args = (0xFFFF,) if name == "ptrace" else (0, 0, 0)  # ptrace: invalid request
-            result = libc.syscall(nr, *args)
-            seen[name] = "EPERM" if result < 0 and ctypes.get_errno() == 1 else str(result)
-        await runtime.write(NET_PROBE, json.dumps(seen).encode())
-        return 1.0 if all(v == "EPERM" for v in seen.values()) else 0.0
-
-
 def test_the_scoring_process_cannot_reach_into_another_process():
+    from seccomp_probes import NET_PROBE, ProbesProcessReach
+
     episode = Episode(ProbesProcessReach)
     kept = grading_box_files(episode)
     outcome = episode.grade()

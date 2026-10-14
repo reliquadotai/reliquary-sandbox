@@ -36,7 +36,15 @@ bridge's scoring process (never in-process), and checks:
   runtime failed to start a command in the agent's box, and the `grading_box_failed`
   zero the grader keeps when the runtime failed to start a command on every grading
   attempt (`runtime_exec_failed`). A case still failed that way after its retries stops
-  the suite (`ConformanceInfraError`: the CLI's "could not run", exit 2), never a pass.
+  the suite (`ConformanceInfraError`: the CLI's "could not run", exit 2), never a pass;
+* the env's package imports nothing that turns the agent's bytes into code
+  (`unsafe_imports`, a static read of its source): math_verify, sympy, latex2sympy2
+  (their parsers `eval` the agent's text), pickle and its kin (dill, cloudpickle,
+  shelve, marshal), and PyYAML's unsafe loaders (`yaml.load`, `full_load`,
+  `unsafe_load`, `Loader`, ...; `safe_load` is fine). Each one found is a suite problem
+  ("requires review"): the scoring process's audit hook refuses what most of them do
+  (an env using them would grade 0 on everything), and a gadget-capable loader such as
+  PyYAML's escapes it (see `reliquary_sandbox_verifiers.scoring_process`).
 
 Env hooks: `Task.setup`, the optional `Task.grading_setup` (the pristine grading box,
 before the restore), `Task.finalize` and the rewards all run in the bridge's scoring
@@ -62,9 +70,11 @@ FakeBoxes (`testing`) runs instead of the script. A script missing a tool it nee
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import hashlib
 import importlib
+import os
 import posixpath
 import random
 import secrets
@@ -86,7 +96,7 @@ __all__ = ["BUILTIN", "CASES_ATTRIBUTE", "ENV", "ENV_FAULTS", "INFRA_RETRIES", "
            "CaseRun", "ConformanceCase", "ConformanceError", "ConformanceInfraError",
            "ConformanceReport", "builtin_cases",
            "check_case", "env_cases", "plan_cases", "run_conformance", "sample_indices",
-           "sample_seed", "suite_problems"]
+           "sample_seed", "suite_problems", "unsafe_imports"]
 
 CASES_ATTRIBUTE = "conformance_cases"
 ENV, BUILTIN = "env", "builtin"
@@ -101,6 +111,15 @@ LARGE_ARTIFACT_BYTES = 31 * 1024**2
 default state cap less 1 MiB); `plan_cases` uses the env's `max_artifact_bytes` - 1 MiB."""
 IMPLICIT_ROOT = "/logs/artifacts"
 """verifiers' own artifact directory: filled (created) even when absent."""
+UNSAFE_MODULES = frozenset({"math_verify", "sympy", "latex2sympy2", "pickle", "_pickle",
+                            "dill", "cloudpickle", "shelve", "marshal"})
+"""Modules an env's package must not import (`unsafe_imports`): their parsers turn text
+or bytes into code (sympy's `parse_expr` and what calls it `eval`; unpickling calls any
+global)."""
+UNSAFE_YAML = frozenset({"load", "load_all", "full_load", "full_load_all", "unsafe_load",
+                         "unsafe_load_all", "Loader", "FullLoader", "UnsafeLoader",
+                         "UnsafeConstructor", "FullConstructor", "Unpickler"})
+"""PyYAML names that build arbitrary Python objects (`safe_load` and `SafeLoader` do not)."""
 TAG_BYTES = 8
 """Names of the files a case leaves in the box (the mark, the fill file, the shim kit)
 come from a random tag drawn for each plan: no fixed name for an env to look for."""
@@ -516,6 +535,8 @@ class ConformanceReport:
     image_lock_sha256: str | None = None
     """`ImageLock.sha256()` of the lock the env was served with in this run (None: not a
     bridged env): a report attests the env under exactly this image lock."""
+    unsafe_imports: tuple[str, ...] = ()
+    """`unsafe_imports` of the env's package (each also a suite problem)."""
 
     @property
     def passed(self) -> bool:
@@ -544,6 +565,7 @@ class ConformanceReport:
                 "regraded": self.regraded, "helper_retries": self.helper_retries,
                 "problems": list(self.problems), "sample_seed": self.sample_seed,
                 "sample_salt": self.sample_salt, "image_lock_sha256": self.image_lock_sha256,
+                "unsafe_imports": list(self.unsafe_imports),
                 "results": [{"case": {**asdict(r.case), "kind": r.case.kind},
                              "runs": [asdict(run) for run in r.runs],
                              "problems": list(r.problems), "ok": r.ok}
@@ -582,6 +604,68 @@ def check_case(case: ConformanceCase, runs: Sequence[CaseRun], *,
     if len({(run.status, run.reward, run.fault) for run in runs}) > 1:
         problems.append("not deterministic: " + ", ".join(_outcome(run) for run in runs))
     return tuple(problems)
+
+
+def _package_files(module: Any) -> list[tuple[str, str]]:
+    """(path, name) of every `.py` file of `module`'s package (its own file for a plain
+    module); the name is relative to the package's parent directory."""
+    paths = list(getattr(module, "__path__", None) or ())
+    if not paths:
+        origin = getattr(module, "__file__", None)
+        return [(origin, os.path.basename(origin))] if origin and origin.endswith(".py") else []
+    found = []
+    for root in paths:
+        for directory, dirs, names in os.walk(root):
+            dirs[:] = sorted(d for d in dirs if d != "__pycache__" and not d.startswith("."))
+            found.extend((path, os.path.relpath(path, os.path.dirname(root)))
+                         for path in (os.path.join(directory, n) for n in sorted(names)
+                                      if n.endswith(".py")))
+    return found
+
+
+def _unsafe_in(tree: ast.AST) -> list[tuple[int, str]]:
+    found, yaml_names = [], set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                top = alias.name.split(".")[0]
+                if top in UNSAFE_MODULES:
+                    found.append((node.lineno, f"imports {alias.name}"))
+                elif top == "yaml":
+                    yaml_names.add(alias.asname or "yaml")
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            top = node.module.split(".")[0]
+            if top in UNSAFE_MODULES:
+                found.append((node.lineno, f"imports from {node.module}"))
+            elif top == "yaml":
+                for alias in node.names:
+                    if alias.name == "*" or alias.name in UNSAFE_YAML:
+                        found.append((node.lineno, f"imports yaml.{alias.name}"))
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Attribute) and node.attr in UNSAFE_YAML
+                and isinstance(node.value, ast.Name) and node.value.id in yaml_names):
+            found.append((node.lineno, f"uses yaml.{node.attr}"))
+    return sorted(set(found))
+
+
+def unsafe_imports(module: Any) -> tuple[str, ...]:
+    """What the env's package (`module`'s package directory, or its own file) imports
+    that turns data into code: `UNSAFE_MODULES`, and PyYAML's `UNSAFE_YAML` names. Static
+    (the source's syntax tree, never imported): `<file>:<line>: <what>`, the file relative
+    to the package's parent directory. It sees every import statement of the package's
+    own files, at any depth (a function's lazy import included), not an import built at
+    run time (`importlib.import_module(name)`) nor what a dependency imports. A file it
+    cannot parse is reported too."""
+    found = []
+    for path, name in _package_files(module):
+        try:
+            with open(path, "rb") as source:
+                tree = ast.parse(source.read(), filename=path)
+        except (OSError, SyntaxError, ValueError) as exc:
+            found.append(f"{name}: cannot be read ({type(exc).__name__})")
+            continue
+        found.extend(f"{name}:{line}: {what}" for line, what in _unsafe_in(tree))
+    return tuple(found)
 
 
 def suite_problems(cases: Sequence[ConformanceCase]) -> tuple[str, ...]:
@@ -680,13 +764,15 @@ async def run_conformance(gateway: LocalGateway, *, env: str, env_package: str,
                           cases: Sequence[ConformanceCase], repeat: int = 2,
                           budgets: Budgets | None = None,
                           run_budget_s: float | None = RUN_BUDGET_S,
-                          image_lock_sha256: str | None = None) -> ConformanceReport:
+                          image_lock_sha256: str | None = None,
+                          unsafe: Sequence[str] = ()) -> ConformanceReport:
     """Run every case `repeat` times on `gateway` (the runs of a case at the same time,
     the cases one after the other) and judge them. Fewer than MIN_REPEAT runs check no
     determinism: the report then fails (a diagnostic run, never a gate). A run the host
     failed is run again (`_run_retrying`); ConformanceInfraError when it keeps failing.
     `image_lock_sha256`: the digest of the image lock the gateway serves the env with,
-    recorded in the report (a validator checks it against the lock it pins)."""
+    recorded in the report (a validator checks it against the lock it pins). `unsafe`:
+    `unsafe_imports` of the env's package, recorded, and each a suite problem."""
     if repeat < 1:
         raise ValueError("repeat must be at least 1")
     results = []
@@ -701,8 +787,10 @@ async def run_conformance(gateway: LocalGateway, *, env: str, env_package: str,
         runs = [item for item in outcomes if isinstance(item, CaseRun)]
         results.append(CaseResult(case, tuple(runs),
                                   check_case(case, runs, budget_s=run_budget_s)))
-    problems = suite_problems(cases)
+    problems = suite_problems(cases) + tuple(
+        f"requires review: the env's package {item} (data to code: the scoring process "
+        "refuses it, or cannot contain it)" for item in unsafe)
     if repeat < MIN_REPEAT:
         problems += (f"repeat {repeat}: determinism needs {MIN_REPEAT} runs at the same time",)
     return ConformanceReport(env, env_package, tuple(results), problems,
-                             image_lock_sha256=image_lock_sha256)
+                             image_lock_sha256=image_lock_sha256, unsafe_imports=tuple(unsafe))

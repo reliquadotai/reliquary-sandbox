@@ -30,7 +30,13 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .conformance import SAMPLE_SIZE, ConformanceReport, plan_cases, run_conformance
+from .conformance import (
+    SAMPLE_SIZE,
+    ConformanceReport,
+    plan_cases,
+    run_conformance,
+    unsafe_imports,
+)
 from .local_gateway import local_gateway
 from .registry import TaskRegistry
 
@@ -130,7 +136,8 @@ async def _run(args, registry, cases, images, options, workdir: Path) -> Conform
                        **_gateway_settings(args, workdir)) as gateway:
         return await run_conformance(gateway, env=ENV, env_package=registry.versions()[ENV],
                                      cases=cases, repeat=args.repeat,
-                                     image_lock_sha256=registry.bridged(ENV).lock.sha256())
+                                     image_lock_sha256=registry.bridged(ENV).lock.sha256(),
+                                     unsafe=unsafe_imports(registry.bridged(ENV).module))
 
 
 def _could_not_run(exc: BaseException) -> int:

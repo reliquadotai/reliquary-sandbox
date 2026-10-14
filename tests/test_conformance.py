@@ -872,3 +872,68 @@ async def test_a_clean_run_records_no_retries(tmp_path):
         report = await run_conformance(gateway, env="toy", env_package="toy", cases=[SOLVE])
         assert gateway.app.state.service["episodes"].grader.retry_log == {}
     assert report.results[0].ok and (report.regraded, report.helper_retries) == (0, 0)
+
+
+# -- the env's package imports nothing that turns data into code ----------------------
+
+def _package(tmp_path, files):
+    import types
+
+    root = tmp_path / "some_env"
+    for name, text in files.items():
+        (root / name).parent.mkdir(parents=True, exist_ok=True)
+        (root / name).write_text(text)
+    module = types.ModuleType("some_env")
+    module.__path__ = [str(root)]
+    return module
+
+
+def test_the_toy_envs_have_no_unsafe_import():
+    assert conformance.unsafe_imports(toy_bridge_env) == ()
+    assert conformance.unsafe_imports(hostile_bridge_env) == ()
+
+
+def test_unsafe_imports_are_found_at_any_depth_of_the_package(tmp_path):
+    module = _package(tmp_path, {
+        "__init__.py": "import json\nimport yaml\n\ndef f(t):\n    return yaml.safe_load(t)\n",
+        "grading.py": ("def reward(text):\n    from math_verify import parse\n"
+                       "    return parse(text)\n"),
+        "sub/deep.py": ("import pickle as p\nimport sympy.parsing\nfrom latex2sympy2 import x\n"
+                        "import yaml as y\nfrom yaml import FullLoader, safe_load\n"
+                        "y.load('a', Loader=y.Loader)\ny.unsafe_load('a')\n"),
+        "broken.py": "def (:\n",
+        "data.txt": "import pickle\n",
+    })
+    assert conformance.unsafe_imports(module) == (
+        "some_env/broken.py: cannot be read (SyntaxError)",
+        "some_env/grading.py:2: imports from math_verify",
+        "some_env/sub/deep.py:1: imports pickle",
+        "some_env/sub/deep.py:2: imports sympy.parsing",
+        "some_env/sub/deep.py:3: imports from latex2sympy2",
+        "some_env/sub/deep.py:5: imports yaml.FullLoader",
+        "some_env/sub/deep.py:6: uses yaml.Loader",
+        "some_env/sub/deep.py:6: uses yaml.load",
+        "some_env/sub/deep.py:7: uses yaml.unsafe_load",
+    )
+
+
+def test_a_single_module_env_is_read_alone(tmp_path):
+    import types
+
+    path = tmp_path / "single_env.py"
+    path.write_text("import dill\n")
+    module = types.ModuleType("single_env")
+    module.__file__ = str(path)
+    assert conformance.unsafe_imports(module) == ("single_env.py:1: imports dill",)
+
+
+async def test_an_unsafe_import_fails_the_suite_as_requiring_review(tmp_path):
+    cases = env_cases(toy_bridge_env, "rl")[:1]
+    with fake_gateway(tmp_path, envs={"toy": TOY}, **GW) as (gateway, _boxes):
+        report = await run_conformance(gateway, env="toy", env_package="toy", cases=cases,
+                                       unsafe=("toy/grading.py:3: imports sympy",))
+    assert not report.passed
+    assert report.unsafe_imports == ("toy/grading.py:3: imports sympy",)
+    assert report.to_json()["unsafe_imports"] == ["toy/grading.py:3: imports sympy"]
+    assert any(p.startswith("requires review: the env's package toy/grading.py:3: imports "
+                            "sympy") for p in report.problems)
