@@ -1,0 +1,37 @@
+services:
+  controller:
+    build:
+      context: .
+      target: controller
+    image: reliquary-sandbox-controller:0.1.0
+    restart: unless-stopped
+    init: true
+    user: "0:0"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    ports:
+      - "${RELIQUARY_SANDBOX_BIND_ADDRESS:-127.0.0.1}:8000:8000"
+    environment:
+      RELIQUARY_SANDBOX_TOKENS: ${RELIQUARY_SANDBOX_TOKENS:?Generate tenant credentials in .env first}
+      RELIQUARY_SANDBOX_PUBLIC_BASE_URL: ${RELIQUARY_SANDBOX_PUBLIC_BASE_URL:-http://127.0.0.1:8000}
+      RELIQUARY_SANDBOX_STATE_DIR: /data
+      RELIQUARY_SANDBOX_DOCKER_HOST: unix:///var/run/docker.sock
+      RELIQUARY_SANDBOX_DOCKER_RUNTIME: runsc
+      RELIQUARY_SANDBOX_REQUIRE_GVISOR: "true"
+      RELIQUARY_SANDBOX_DEFAULT_IMAGE: ${RELIQUARY_SANDBOX_DEFAULT_IMAGE:-reliquary-sandbox-guest:0.1.0}
+      RELIQUARY_SANDBOX_ALLOWED_IMAGES: ${RELIQUARY_SANDBOX_ALLOWED_IMAGES:-["reliquary-sandbox-guest:0.1.0"]}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - state:/data
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=67108864
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=5)"]
+      interval: 15s
+      timeout: 6s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  state:

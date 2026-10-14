@@ -1,0 +1,35 @@
+# Episode hosts only (EPISODES_ENABLED=true with a `verifiers:` entry): the sizing the
+# verifiers bridge's scoring processes need, on top of compose.yaml. Tenant-API and
+# corpus-executor hosts use compose.yaml alone and keep its settings.
+#
+#   docker compose -f compose.yaml -f compose.episodes.yaml up -d
+#
+# Needs Docker Compose 2.24.4 or later (the `!override` tag below). docs/deployment.md,
+# "The scoring users (verifiers bridge)".
+services:
+  controller:
+    # Each scoring process runs as its slot's uid (200000-200063) and every process of
+    # that uid is killed after it. SETUID/SETGID/CHOWN for the drop; KILL is not needed
+    # (the sweeper signals as the slot's uid).
+    cap_add: [SETUID, SETGID, CHOWN]
+    # Bounds for the whole controller, scoring processes included: 64 slots x
+    # RLIMIT_NPROC 64 would be 4096 tasks; episode capacity 4 x 64 + the service's
+    # threads fit in 1024. Memory: scoring tmpfs (512 MiB) + EPISODE_CAPACITY x the
+    # scoring memory budget (2 GiB address space each) + the service. Resize both with
+    # EPISODE_CAPACITY.
+    pids_limit: 1024
+    mem_limit: 12g
+    # SysV shared memory a scoring process created dies with it (its uid's POSIX shm and
+    # semaphores in /dev/shm are removed by the sweeper).
+    sysctls:
+      kernel.shm_rmid_forced: 1
+    environment:
+      RELIQUARY_SANDBOX_SCORING_TMP_ROOT: /scoring
+    # Replaces compose.yaml's list (a merge would mount /tmp twice).
+    tmpfs: !override
+      # 0700: root's only; a scoring uid can leave nothing there.
+      - /tmp:rw,noexec,nosuid,mode=0700,size=67108864
+      # Scoring TMPDIRs, apart from the service's /tmp: one episode filling it cannot
+      # starve the service (each file is capped by RLIMIT_FSIZE, 64 MiB by default; the
+      # inodes by nr_inodes).
+      - /scoring:rw,noexec,nosuid,nodev,mode=0755,size=536870912,nr_inodes=65536

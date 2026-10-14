@@ -1,0 +1,9 @@
+{"check": "agent_box", "memory": 1073741824, "nano_cpus": 1000000000, "runtime": "runsc"}
+{"boxes_per_episode": 1, "check": "held", "cpu_millis": 1000, "cpu_overcommit_permille": 1000, "free_cpu_millis": 0, "free_memory_bytes": 2147483648, "max_box_cpu_millis": 1000, "memory_bytes": 3221225472, "sessions": ["s-1"], "used_cpu_millis": 1000, "used_memory_bytes": 1073741824}
+{"check": "second_open", "detail": "no free resources", "reason": "no_free_resources", "receipt": true, "status": 503}
+{"check": "first_final", "free_cpu_millis": 1000, "pool": {"cpu_millis": 1000, "memory_bytes": 2147483648, "timeouts": 0, "used_cpu_millis": 0, "used_memory_bytes": 0, "waiting": 0, "waits": 0}, "reward": 0.0, "sessions": [], "status": "graded"}
+{"boxes_per_episode": 1, "check": "after", "cpu_millis": 1000, "cpu_overcommit_permille": 1000, "free_cpu_millis": 0, "free_memory_bytes": 2147483648, "max_box_cpu_millis": 1000, "memory_bytes": 3221225472, "sessions": ["s-3"], "used_cpu_millis": 1000, "used_memory_bytes": 1073741824}
+{"check": "route_refusal", "detail": "no free resources", "header": true, "reason": "no_free_resources", "retry_after": "5", "status": 503, "valid": true}
+{"check": "client_refusal", "detail": "no free resources", "receipt": true, "status": 503, "valid": true}
+{"check": "unapproved_image", "detail": "image not approved on this machine", "reason": "task_refused", "status": 422, "valid": true}
+{"check": "pool_two_gradings", "finals": {"w-1": ["graded", 1.0], "w-2": ["graded", 1.0]}, "finish_s": 0.91, "max_used_grading_cpu": 1000, "max_waiting": 1, "min_agent_free_cpu": 0, "pool": {"cpu_millis": 1000, "memory_bytes": 2147483648, "timeouts": 0, "used_cpu_millis": 0, "used_memory_bytes": 0, "waiting": 0, "waits": 1}, "resources_free_cpu": 2000, "samples": 9}

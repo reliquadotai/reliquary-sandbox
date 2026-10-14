@@ -1,0 +1,73 @@
+name: checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          version: "0.11.10"
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --all-extras --frozen
+      - name: Install busybox (the bash runner tests run its scripts)
+        run: sudo apt-get update && sudo apt-get install -y busybox-static
+      - run: uv run ruff check .
+      - run: uv run pytest -q -m "not live"
+      - run: uv build
+      - name: Check runtime installer syntax
+        run: bash -n scripts/bootstrap-runtime.sh
+
+  runtime:
+    needs: unit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          version: "0.11.10"
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --all-extras --frozen
+      - name: Install and register pinned gVisor
+        run: sudo ./scripts/bootstrap-runtime.sh --configure-docker
+      - name: Build approved guest
+        run: docker build --target guest -t reliquary-sandbox-guest:0.1.0 .
+      - name: Exercise real sandbox lifecycle through the SDK
+        env:
+          RUN_SANDBOX_LIVE: "1"
+        run: uv run pytest -q -m live tests/test_live.py
+      - name: Build controller image
+        run: docker build --target controller -t reliquary-sandbox-controller:0.1.0 .
+      - name: Start Compose deployment
+        run: |
+          umask 077
+          python3 - <<'PY'
+          import json
+          import secrets
+          from pathlib import Path
+          Path(".env").write_text("RELIQUARY_SANDBOX_TOKENS=" + json.dumps({"checks": secrets.token_urlsafe(32)}) + "\n")
+          PY
+          docker compose up -d --no-build --wait --wait-timeout 60
+          curl --fail --silent http://127.0.0.1:8000/readyz
+      - name: Stop Compose deployment
+        if: always()
+        run: |
+          if [ -f .env ]; then
+            docker compose down --volumes
+          fi

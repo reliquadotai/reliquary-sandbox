@@ -1,0 +1,43 @@
+[project]
+name = "reliquary-sandbox"
+version = "0.1.0"
+description = "On-demand isolated workspaces for miners, agents, and evaluations"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = [
+  "httpx>=0.25.0,<1", "pydantic>=2.0.0,<3", "aiofiles>=23.0.0",
+  "tenacity>=8.0.0,<10", "connectrpc>=0.11.1,<0.12", "protobuf>=6.31.1,<8",
+  "pyqwest>=0.6.0,<1", "certifi", "cryptography>=43,<47",
+]
+[project.optional-dependencies]
+service = ["fastapi>=0.115,<1", "uvicorn[standard]>=0.30,<1", "docker>=7,<8", "pydantic-settings>=2,<3", "python-multipart>=0.0.20"]
+verifiers = ["verifiers @ git+https://github.com/PrimeIntellect-ai/verifiers.git@b2e4e8157783b2c0dffc7821044c87f29f1c3ccf"]
+dev = ["pytest>=8,<10", "pytest-asyncio>=0.23,<2", "ruff>=0.13,<1", "build>=1,<2"]
+[project.scripts]
+reliquary-sandbox = "reliquary_sandbox.cli:main"
+reliquary-sandbox-conformance = "reliquary_sandbox_service.episodes.conformance_cli:main"
+reliquary-sandbox-reference-sweep = "reliquary_sandbox_service.episodes.reference_sweep:main"
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+[tool.hatch.metadata]
+allow-direct-references = true
+[tool.hatch.build.targets.wheel]
+packages = ["src/reliquary_sandbox", "src/reliquary_sandbox_service", "src/reliquary_sandbox_verifiers"]
+[tool.hatch.build.targets.wheel.force-include]
+LICENSES = "reliquary_sandbox/licenses"
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = ["live: requires Linux Docker with gVisor (opt-in; never on production hosts)"]
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["src/reliquary_sandbox/_proto"]
+[tool.ruff.lint]
+select = ["E", "F", "I", "E301", "E302", "E303", "E304", "E305", "E306"]
+# The blank-line rules (E30x) are preview rules: enable exactly those.
+preview = true
+explicit-preview-rules = true
+ignore = ["E501"]

@@ -1,0 +1,49 @@
+# API compatibility
+
+The Python package is `reliquary-sandbox`, imported as `reliquary_sandbox`. Its typed SDK surface includes lifecycle and checkpoint operations, file handling, command transport, image management clients, process clients, retries, and batch polling. Select a compatible API with `RELIQUARY_SANDBOX_API_BASE_URL` and its credential with `RELIQUARY_SANDBOX_API_KEY`.
+
+The self-hosted service implements a bounded container runtime. `SandboxClient` and `AsyncSandboxClient` default to `runtime="container"`. Use `runtime="vm"` only with an API that actually provides VM-backed sandboxes; this service rejects VM requests.
+
+## Supported protocol
+
+Lifecycle requests preserve the SDK JSON models, field aliases, sandbox statuses, checkpoint states, and batch lookup response shapes. File operations use the SDK's authenticated gateway paths. Commands use the binary Connect RPC `command_session.CommandSession/Start` method and the generated protobuf event models. Both synchronous and asynchronous SDK execution use this command transport.
+
+Command responses preserve stdout, stderr, and the guest exit code. Exceeding the captured-output limit produces a protocol error instead of a successful partial response. Command timeouts remove the sandbox; subsequent work requires a new sandbox or a checkpoint restore. The JSON command endpoint also reports explicit timeout and truncation flags.
+
+Workspace checkpoints preserve files only. `DURABLE` means the bounded archive is persisted in the controller's state directory; it does not mean a process or VM checkpoint exists. Restore requires the state volume and the original approved guest image to remain available.
+
+Authenticated `GET /api/v1/capabilities` reports the runtime's available operations and configured bounds. Authenticated `GET /api/v1/openapi.json` returns the current REST schema. `/health` checks the controller process and `/readyz` checks the configured runtime.
+
+## Explicit limits
+
+There is no VM fleet, GPU allocator, SSH access service, guest public network access, registry publishing, image build service, billing service, or reconnectable background process session service in this deployment. The related SDK models and clients are retained for integrations targeting compatible APIs, but this controller returns explicit unsupported-operation responses.
+
+Do not infer hosted-service parity from a shared request format. Integration qualification should exercise the exact endpoints and workload assumptions used by the caller.
+
+## Evaluation integration
+
+Create one sandbox per evaluation or bounded workload, upload the necessary input files to `/workspace`, execute the evaluation command with an explicit timeout, and download the resulting artifacts before deleting the sandbox. Preinstall dependencies in an approved guest image because guests cannot fetch packages from the network.
+
+Use `environment_vars` for workload configuration. The SDK retains the `secrets` model for compatible providers, but this controller does not provide managed secret injection. A command can read its own guest environment; printed guest values become output and should be handled accordingly. Tenant credentials belong on the client/controller side, outside guest environments.
+
+## Signed episodes
+
+Episode hosts (`EPISODES_ENABLED=true`) add an API that is not part of the Prime-compatible surface. The SDK does not wrap it, and the routes exist only when episodes are enabled. Operation, limits and failure rules are in [deployment: episode hosts](deployment.md#episode-hosts).
+
+- `POST /episodes` with `{"token": <session token>}` returns `{"episode_id", "episode_key", "record"}`. The token is a validator-signed Ed25519 object from `reliquary_sandbox.attest.issue_session_token`; it opens one episode, whose id is its session id. `record` is the signed record 0. The episode key is derived from the token (`HMAC-SHA256` with a machine secret) and shown only to a request carrying that token: sending the same token again returns the same response while the episode runs, `409` busy while it is still opening, and `409` with the final once it is closed.
+- `POST /episodes/{id}/calls` with `Authorization: Bearer <episode_key>` and body `{"turn", "k", "tool", "arguments"}` returns `{"record", "final"}`. Calls are strictly sequential: the first call has `k=0` in any turn; each later call is the next `k` in the same turn (`k+1`), or `k=0` in any later turn (turns may be skipped). Resending a recorded `(turn, k)` with the same tool and arguments returns the stored record without running it again; with different content it is `409`. `final` is set when this call ended the episode because the CPU budget ran out, the transcript came within one worst-case call and final of the machine's cap (`budget_exhausted`, reason `transcript_bytes`; the call itself is recorded; the signed transcript, final included, never passes the cap, at most 8 MiB of compact UTF-8 JSON), or the deadline passed.
+- `POST /episodes/{id}/finish` extracts the state, grades it in a pristine box and returns `{"record": <final record>, "state": <base64 or null>}`. `state` is set only for tasks that publish it. Calling it again returns the same result.
+- `GET /episodes/{id}` returns `{"status", "final_status", "transcript": {"token", "records"}}`. `status` is the episode's state (`RUNNING`, `FINISHING`, `CLOSED`); `final_status` is the final record's status, or `open_failed` / `aborted_unsigned` for an episode closed without one. One read at a time per episode (`409` while another runs).
+- `GET /capacity` needs no credential and returns a signed capacity report `{"document", "signature"}`.
+
+Records are `{"body", "machine_id", "key_id", "signature"}`. Record 0 (`kind` `open`) carries the session id, `token_sha256`, image, env, `env_package` (`distribution==version+g<digest>`, the digest being the first 16 hex of a sha256 over the package's installed `.py` files; validators allow-list accepted values, computed with `reliquary_sandbox_service.episodes.env_package_of`), `tools_version`, `tools` (the task's offered tools: a sorted, unique, non-empty subset of `bash`, `edit`), `setup_output_sha256` and the effective budgets. Miners and validators pass `tools` to `observation.plan_call(offered=...)`; `verify_transcript(...).tools` exposes it. Call records carry `turn`, `k`, `tool`, `arguments`, `output`, `exit_code`, `truncated`, `timed_out`, `cpu_ms`, `wall_ms`, `at` and `prev`. The final record carries `status`, `reward` (a float, present only when `graded`), `grading` facts, `state_sha256`, `cpu_total_ms` and `reason`. Each record's `prev` is the hash of the previous record's body, the SHA-256 of its canonical JSON. Hashes and signatures are over the received JSON, never a re-serialised copy.
+
+Final statuses are `graded`, `expired` and `budget_exhausted` (the agent's doing, only `graded` has a reward), `box_failed` (the agent's box became unusable through its own actions; not paid, not voided) and `aborted` (our side failed; void, the task can be run again; reason `task_changed` when the env declares the task differently after a controller restart).
+
+Env hooks (`prepare`, `extract`, `grade`) receive a `reliquary_sandbox.episode_task.TaskRuntime`: `run`, `read` (with `max_bytes`), `write`, `alive`, `prepare_setup`, `prepare_execution`, `process_env`, `env`, `config.workdir`/`type`, and the sandbox's own `archive(paths, max_bytes)`, `restore_archive(data, roots)` and `stop_processes()`. `stop_processes()` kills every process left in the box except PID 1, the entrypoint and the helper (the helper busybox, as root, in bounded rounds), for hooks that must read a result only after nothing the agent influenced can still change it; our failure there is `aborted`, processes that keep respawning are the agent's (graded 0 `grading_box_failed` in the grading box). Other verifiers Runtime members abort the episode. A hook may raise `reliquary_sandbox.episode_task.EnvInfraError` for a failure of its own (only before any agent-controlled state is applied, or for its own invariants): the episode ends `aborted`, counted per env as `env_infra_error`.
+
+Tools: `bash` returns stdout followed by stderr. Each call is a fresh `bash -c` in the task's workdir. `edit` replaces a string that must occur exactly once. Output beyond `EPISODE_OUTPUT_CAP_BYTES` is cut and flagged `truncated`. Unknown tools and malformed arguments produce a signed error record (exit code 127 or 2) and run nothing. Differences from the verifiers bash harness are listed in the deployment guide; record 0 carries `tools_version` (`reliquary-tools/1`).
+
+Errors on a closed episode return `409` (or `503` after a sandbox failure) with `{"detail": {"message", "final"}}`, so the caller always receives the signed final record. Other statuses: `401` for an invalid or expired token, an unknown episode or a wrong key; `403` for a token for another machine; `409` for a busy episode, a token already used for another outcome (see `POST /episodes`) or an out-of-order call; `413` and `422` for oversize or unacceptable input; `503` with `Retry-After` for a full or recovering machine, and `503` without it for a failed open, which burns the token.
+
+`reliquary_sandbox.attest.verify_transcript` checks a transcript offline. It is a pure function of the transcript, the machine directory, the token verifier and the expected bindings. A graded reward outside `[0, 1]` is refused (`reward_out_of_range`), and so is a call record whose tool is not in record 0's `tools` (`tool_not_offered`). A passing result does not make the episode payable: the caller must still compare the calls with the proven tokens, compare the final state hash with the submitted diff, record the session id atomically, and reject submissions later than `expires_at + GRADING_GRACE_S` by its own clock.

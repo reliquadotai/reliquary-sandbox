@@ -1,0 +1,15 @@
+#!/bin/sh
+# The interpreter of the verifiers bridge's scoring forkserver (and of every scoring
+# process it forks): Python with an EMPTY environment, so no secret of the controller
+# (tokens, keys, credentials passed as variables) is ever in the forkserver's memory.
+# The controller points multiprocessing at this file (`set_executable`); the image
+# installs it at /usr/local/libexec/reliquary-scoring-python (not under /tmp: noexec).
+# RELIQUARY_SCORING_PYTHON overrides the interpreter (tests); it is dropped with the rest.
+# Math libraries (OpenBLAS, OpenMP, MKL) run on one thread: a scoring process's threads
+# count against its RLIMIT_NPROC and its CPU against RLIMIT_CPU. PYTHONHASHSEED=0: hash()
+# of a str or bytes is the same on every validator and after every restart (the
+# forkserver's seed is inherited by every scoring process), so an env's set order is too.
+set -eu
+python="${RELIQUARY_SCORING_PYTHON:-/app/.venv/bin/python}"
+exec /usr/bin/env -i PATH="${python%/*}:/usr/local/bin:/usr/bin:/bin" LANG="${LANG:-C.UTF-8}" \
+    PYTHONHASHSEED=0 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 "$python" "$@"
