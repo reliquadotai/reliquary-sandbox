@@ -66,6 +66,8 @@ def test_options_are_read_from_plain_settings_values():
 @pytest.mark.parametrize("raw", [
     {"tools": []}, {"tools": ["bash", "bash"]}, {"tools": ["python"]},
     {"splits": {}}, {"splits": {"eval": {}}}, {"splits": {"held": {"split": "eval"}}},
+    {"splits": {"rl": {"split": "eval"}}}, {"splits": {"eval": {"split": "rl"}}},
+    {"splits": {"verified_eval": {"split": "train"}}},
     {"splits": {"rl": {"id": "another-env"}}}, {"splits": {"bad name": {}}},
     {"splits": {"Eval": {"split": "rl"}}}, {"splits": {"EVAL": {"split": "rl"}}},
     {"splits": {"eval ": {"split": "rl"}}}, {"splits": {"rl+eval": {"split": "rl"}}},
@@ -102,6 +104,14 @@ def test_a_declared_env_serves_its_tasks_by_split_and_index():
 def test_tasks_outside_the_served_splits_or_range_are_refused(split, index, error):
     with pytest.raises(error):
         _env().task(split, index)
+
+
+def test_an_eval_split_is_served_only_under_a_name_that_says_eval():
+    options = VerifiersEnvOptions.from_mapping(
+        {"splits": {"rl": {"split": "rl"}, "eval": {"split": "eval"},
+                    "verified_eval": {"split": "eval"}}})
+    assert dict(options.splits["eval"]) == {"split": "eval"}
+    assert dict(options.splits["verified_eval"]) == {"split": "eval"}
 
 
 def test_split_names_map_to_taskset_config_overrides():
