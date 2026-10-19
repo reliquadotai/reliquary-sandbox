@@ -19,6 +19,7 @@ test (`tests/test_upstream_parity.py`) holds it equal to those files.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 from collections.abc import Iterable, Mapping, Sequence
@@ -95,19 +96,48 @@ class HarnessSpec:
             raise ValueError(f"the {self.family} harness offers {offered}, not {list(names)}")
         return names
 
-    def tool_specs(self, tools: Iterable[str]) -> tuple[dict[str, Any], ...]:
+    def surface_names(self, values: Mapping[str, Any] | None = None) -> dict[str, str]:
+        """{canonical tool name: the name the model is shown} under a variant's axis values
+        (`variant.variant(spec, index).values`; None or no `tools` axis: the canonical names)."""
+        surface = (values or {}).get("tools") or {}
+        return {tool["function"]["name"]: surface.get(tool["function"]["name"], {}).get(
+            "name", tool["function"]["name"]) for tool in self.tools}
+
+    def tool_specs(self, tools: Iterable[str], values: Mapping[str, Any] | None = None) -> tuple[dict[str, Any], ...]:
         """The tool specs the model is shown for `tools` (order and repeats do not matter;
         a set the spec does not offer is refused): the renderer parses with exactly these,
-        since parameter coercion follows their schemas."""
+        since parameter coercion follows their schemas. A variant's `tools` axis renames a
+        tool and rewords its description; its parameters stay the canonical ones."""
         names = self.tool_set(tools)
-        return tuple(tool for tool in self.tools if tool["function"]["name"] in names)
+        surface = (values or {}).get("tools") or {}
+        shown = []
+        for tool in self.tools:
+            name = tool["function"]["name"]
+            if name not in names:
+                continue
+            if name in surface:
+                function = dict(tool["function"], name=surface[name]["name"],
+                                description=surface[name]["description"])
+                tool = dict(tool, function=function)
+            shown.append(tool)
+        return tuple(shown)
 
-    def system_prompt_for(self, tools: Iterable[str]) -> str:
+    def system_prompt_for(self, tools: Iterable[str], values: Mapping[str, Any] | None = None) -> str:
+        """The enabled fragments joined; a variant's `system_prompt` axis is a fragment per
+        tool, with `{bash}`/`{edit}` standing for the tools' surface names."""
         names = self.tool_set(tools)
-        fragments = self.system_prompt["fragments"]
+        phrased = (values or {}).get("system_prompt")
+        fragments = phrased if phrased is not None else self.system_prompt["fragments"]
+        surface = self.surface_names(values)
+        render = (lambda text: text.format(**surface)) if phrased is not None else (lambda text: text)
         return self.system_prompt["join"].join(
-            fragments[tool["function"]["name"]] for tool in self.tools
+            render(fragments[tool["function"]["name"]]) for tool in self.tools
             if tool["function"]["name"] in names and tool["function"]["name"] in fragments)
+
+    def observation_format(self, values: Mapping[str, Any] | None = None) -> str:
+        """How a signed call record is shown: `plain` (the gateway's rendering as is) or a
+        variant's `observation` axis value (`decorate_observation`)."""
+        return (values or {}).get("observation", "plain")
 
     def with_network_notice(self, content: str) -> str:
         notice = self.network_notice["text"]
@@ -197,7 +227,49 @@ BASH_VF_B2E4E81 = HarnessSpec(
               }},
 )
 
-SPECS: dict[str, HarnessSpec] = {BASH_VF_B2E4E81.key: BASH_VF_B2E4E81}
+OBSERVATION_FORMATS = ("plain", "exit-code")
+
+
+def decorate_observation(fmt: str, body: Mapping[str, Any], text: str) -> str:
+    """A signed call record's observation in format `fmt`: `text` is the gateway's rendering
+    of `body` (`reliquary_sandbox.observation.render_observation`); `exit-code` puts the
+    command's signed exit code on a line before it. A refused call (no record) is never
+    decorated."""
+    if fmt == "plain":
+        return text
+    if fmt == "exit-code":
+        code = body["exit_code"]
+        if type(code) is not int:
+            raise ValueError("a call record's exit_code must be an integer")
+        return f"[exit code: {code}]\n{text}"
+    raise ValueError(f"unknown observation format {fmt!r}")
+
+
+SURFACE_TOOLS = {"name": "tools", "values": [
+    {},
+    {"bash": {"name": "shell",
+              "description": "Execute a shell command and return everything it printed: stdout, then stderr."},
+     "edit": {"name": "str_replace",
+              "description": "Replace the one occurrence of old_str in the file at path with new_str. "
+                             "old_str must occur exactly once."}},
+]}
+SURFACE_PROMPTS = {"name": "system_prompt", "values": [
+    {"bash": "You are a coding agent. You have access to a {bash} tool for running shell commands.",
+     "edit": "You also have an {edit} tool for single-occurrence string replacement in a file."},
+    {"bash": "You are a software engineering agent working in a repository. Use the {bash} tool to run "
+             "shell commands and inspect the results.",
+     "edit": "Use the {edit} tool to change a file by replacing one exact occurrence of a string."},
+]}
+
+BASH_SURFACE_V1 = dataclasses.replace(
+    BASH_VF_B2E4E81,
+    id="bash-surface",
+    version="1",
+    # Two tool namings x two prompt phrasings; variant 0 is bash-vf-b2e4e81's surface.
+    variants={"axes": [SURFACE_TOOLS, SURFACE_PROMPTS]},
+)
+
+SPECS: dict[str, HarnessSpec] = {spec.key: spec for spec in (BASH_VF_B2E4E81, BASH_SURFACE_V1)}
 
 
 def get_spec(harness_id: str, version: str) -> HarnessSpec:
@@ -220,6 +292,7 @@ def digest_refusal(harness_id: str, version: str, digest: str) -> str | None:
     return None
 
 
-__all__ = ["BASH_SENTENCE", "BASH_TOOL", "BASH_VF_B2E4E81", "CAPABILITY_NOTICE", "EDIT_SENTENCE", "EDIT_TOOL",
+__all__ = ["BASH_SENTENCE", "BASH_SURFACE_V1", "BASH_TOOL", "BASH_VF_B2E4E81", "OBSERVATION_FORMATS",
+           "decorate_observation", "CAPABILITY_NOTICE", "EDIT_SENTENCE", "EDIT_TOOL",
            "HarnessSpec", "SPECS", "VERIFIERS_COMMIT", "canonical_json", "digest_refusal", "get_spec",
            "harness_digest", "implementation_sha256"]

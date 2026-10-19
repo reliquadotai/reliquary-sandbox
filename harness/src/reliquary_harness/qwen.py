@@ -18,7 +18,8 @@ from collections.abc import Callable, Sequence
 from functools import wraps
 from typing import Any
 
-from .spec import BASH_VF_B2E4E81, HarnessSpec
+from .spec import BASH_VF_B2E4E81, HarnessSpec, decorate_observation
+from .variant import variant as variant_of
 
 
 class UnparsableSpan(ValueError):
@@ -60,16 +61,32 @@ def _locked(method):
     return wrapper
 
 
+HIDDEN_PREFIX = "?"
+"""A call to a canonical tool name the variant does not show is read as `?<name>`: a tool
+nobody offers (`not_offered`), so a hidden name is never executed."""
+
+
 class QwenTurnRenderer:
     """`trajectory_parse.TurnRenderer` over the pinned `renderers` Qwen3.8 renderer and a
-    harness spec's tools and system prompt. `refuse(exc)` builds what a span the parser
-    raised on is refused with (default `UnparsableSpan`)."""
+    harness spec's tools and system prompt, in one of its surface variants (`variant`, an
+    index; 0 is a spec without axes). The model is shown the variant's tool names; the calls
+    read back (`tool_calls`, `calls_of`) carry the canonical names the gateway runs, while the
+    assistant message keeps the names the model wrote (it must re-render to the span).
+    `refuse(exc)` builds what a span the parser raised on is refused with (default
+    `UnparsableSpan`)."""
 
     def __init__(self, renderer, tools=("bash", "edit"), *, spec: HarnessSpec = BASH_VF_B2E4E81,
-                 refuse: Callable[[BaseException], BaseException] | None = None) -> None:
+                 variant: int = 0, refuse: Callable[[BaseException], BaseException] | None = None) -> None:
         from renderers.base import ToolCallParseStatus
 
         self.spec = spec
+        self.variant = variant_of(spec, variant)
+        values = self.variant.values
+        offered = spec.tool_set(tools)
+        surface = spec.surface_names(values)
+        self._canonical = {surface[name]: name for name in offered}
+        self._hidden = frozenset(name for name in surface if surface[name] != name)
+        self.observation_format = spec.observation_format(values)
         self._r = renderer
         # P6: HF tokenizers are not thread-safe; intake, grading and export share this.
         self._lock = threading.RLock()
@@ -83,8 +100,8 @@ class QwenTurnRenderer:
         self._close = renderer._token_id("</tool_response>")
         self.turn_markup_ids = frozenset(
             int(renderer._token_id(t)) for t in ("<|im_start|>", "<tool_response>", "</tool_response>"))
-        self._tools = [dict(tool) for tool in spec.tool_specs(tools)]
-        self._system_prompt = spec.system_prompt_for(tools)
+        self._tools = [dict(tool) for tool in spec.tool_specs(tools, values)]
+        self._system_prompt = spec.system_prompt_for(tools, values)
         self._im_start = int(renderer._token_id("<|im_start|>"))
         self._think = int(renderer._token_id("<think>"))
         self._think_end = int(renderer._token_id("</think>"))
@@ -113,13 +130,29 @@ class QwenTurnRenderer:
             tools=self._tools, add_generation_prompt=True)
         return [int(t) for t in rendered.token_ids]
 
-    @_locked
-    def tool_calls(self, completion_ids) -> list[tuple[str, str]]:
+    def canonical_name(self, name: str) -> str:
+        """The tool a surface name calls: its canonical name, `?<name>` for a canonical name
+        this variant hides, any other name as written (not offered either way)."""
+        if name in self._canonical:
+            return self._canonical[name]
+        return HIDDEN_PREFIX + name if name in self._hidden else name
+
+    def _surface_calls(self, completion_ids) -> list[tuple[str, str]]:
         return pinned_tool_calls(self._parse(completion_ids).tool_calls, self._unknown)
 
+    @_locked
+    def tool_calls(self, completion_ids) -> list[tuple[str, str]]:
+        return [(self.canonical_name(name), arguments) for name, arguments in self._surface_calls(completion_ids)]
+
     def calls_of(self, parsed_calls) -> list[tuple[str, str, str]]:
-        """`calls_with_ids` of a parse result's calls (the generate endpoint's)."""
-        return calls_with_ids(parsed_calls, self._unknown)
+        """`calls_with_ids` of a parse result's calls (the generate endpoint's), canonical names."""
+        return [(call_id, self.canonical_name(name), arguments)
+                for call_id, name, arguments in calls_with_ids(parsed_calls, self._unknown)]
+
+    def observation(self, body, text: str) -> str:
+        """What the model is shown for a signed call record: `text` (the gateway's rendering
+        of `body`) in this variant's observation format."""
+        return decorate_observation(self.observation_format, body, text)
 
     def _parse(self, completion_ids):
         """The pinned parser, made total: whatever it raises on a span refuses it
@@ -233,7 +266,7 @@ class QwenTurnRenderer:
         message = {"role": "assistant", "content": parsed.content or ""}
         if parsed.reasoning_content:
             message["reasoning_content"] = parsed.reasoning_content
-        calls = self.tool_calls(completion_ids)
+        calls = self._surface_calls(completion_ids)
         if calls:
             message["tool_calls"] = [{"id": f"call_{i}", "type": "function",
                                       "function": {"name": name, "arguments": arguments}}
@@ -254,9 +287,11 @@ def build_renderer(checkpoint_dir: str, spec: HarnessSpec = BASH_VF_B2E4E81):
 
 
 def load_turn_renderer(checkpoint_dir: str, tools=("bash", "edit"), *, spec: HarnessSpec = BASH_VF_B2E4E81,
+                       variant: int = 0,
                        refuse: Callable[[BaseException], BaseException] | None = None) -> QwenTurnRenderer:
-    return QwenTurnRenderer(build_renderer(checkpoint_dir, spec), tools=tools, spec=spec, refuse=refuse)
+    return QwenTurnRenderer(build_renderer(checkpoint_dir, spec), tools=tools, spec=spec, variant=variant,
+                            refuse=refuse)
 
 
-__all__ = ["QwenTurnRenderer", "UnparsableSpan", "build_renderer", "calls_with_ids", "load_turn_renderer",
+__all__ = ["HIDDEN_PREFIX", "QwenTurnRenderer", "UnparsableSpan", "build_renderer", "calls_with_ids", "load_turn_renderer",
            "pinned_tool_calls"]
