@@ -1,0 +1,40 @@
+name: Test summary
+description: Retain test counts without captured output or failure details.
+inputs:
+  junit-path:
+    required: true
+    description: Exact temporary pytest JUnit report to summarize.
+  test-outcome:
+    required: true
+    description: Outcome of the pytest step.
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        JUNIT_PATH: ${{ inputs.junit-path }}
+        TEST_OUTCOME: ${{ inputs.test-outcome }}
+      run: |
+        python3 - <<'PYCODE'
+        import json
+        import os
+        import pathlib
+        import xml.etree.ElementTree as ET
+
+        counts = {name: None for name in ("tests", "failures", "errors", "skipped")}
+        source = pathlib.Path(os.environ["JUNIT_PATH"])
+        if source.is_file():
+            suites = list(ET.parse(source).getroot().iter("testsuite"))
+            counts = {name: sum(int(suite.get(name, "0")) for suite in suites) for name in counts}
+            source.unlink()
+        summary = {"suite": os.environ["GITHUB_JOB"], "revision": os.environ["GITHUB_SHA"],
+                   "test_outcome": os.environ["TEST_OUTCOME"], **counts}
+        target = pathlib.Path(os.environ["RUNNER_TEMP"]) / f"test-summary-{os.environ['GITHUB_JOB']}.json"
+        target.write_text(json.dumps(summary, indent=2) + "\n")
+        PYCODE
+    - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: test-summary-${{ github.job }}
+        path: ${{ runner.temp }}/test-summary-${{ github.job }}.json
+        if-no-files-found: error
+        retention-days: 7
