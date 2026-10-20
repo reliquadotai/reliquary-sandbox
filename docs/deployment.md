@@ -105,6 +105,14 @@ Settings below use the `RELIQUARY_SANDBOX_` prefix, like every other controller 
 }
 ```
 
+An additional qualified x86-64 CPU VM profile for runsc `release-20260928.0` with systrap uses
+`"runtimeArgs": ["--overlay2=none", "--systrap-disable-fast-path=true"]`.
+The extra argument disables the systrap fast path; Sentry CPU remains part of measured cgroup usage.
+The bootstrap installs the baseline profile, so qualify this additional argument on a new or drained test host
+with the live CPU, isolation, quota and SDK tests before serving work.
+For the isolated XFS test daemon, set `RUNSC` to a wrapper around the pinned runtime with the same systrap argument,
+since the helper adds only `--overlay2=none`.
+
 ### Machine and validator keys
 
 Generate the machine key on the host. Only the controller reads it:
