@@ -15,18 +15,31 @@ concurrency:
 jobs:
   unit:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12.15"
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
         with:
           version: "0.11.10"
-          python-version: "3.12"
+          python-version: "3.12.15"
           enable-cache: true
       - run: uv sync --all-extras --frozen
+      - name: Check Python socket support
+        run: uv run python -c 'import socket, sys; assert sys.version_info[:3] == (3, 12, 15); assert hasattr(socket, "AF_VSOCK")'
       - name: Install busybox (the bash runner tests run its scripts)
         run: sudo apt-get update && sudo apt-get install -y busybox-static
       - run: uv run ruff check .
+      - name: Check scoring process compatibility
+        run: |
+          uv run pytest -q \
+            tests/test_bridge_grading.py::test_the_scoring_process_holds_no_fd_but_its_pipe_and_keeps_its_limits \
+            tests/test_bridge_grading.py::test_the_scoring_process_has_no_network_but_unix_sockets \
+            tests/test_bridge_grading.py::test_the_network_filter_allows_only_unix_sockets_on_its_own_abi \
+            tests/test_bridge_grading.py::test_an_env_module_the_forkserver_preloaded_is_not_imported_again \
+            tests/test_bridge_grading.py::test_a_scoring_process_without_its_network_filter_refuses_to_score
       - run: uv run pytest -q -m "not live"
       - run: uv build
       - name: Check runtime installer syntax
@@ -38,10 +51,13 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12.15"
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
         with:
           version: "0.11.10"
-          python-version: "3.12"
+          python-version: "3.12.15"
           enable-cache: true
       - run: uv sync --all-extras --frozen
       - name: Install and register pinned gVisor
