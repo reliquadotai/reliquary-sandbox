@@ -103,6 +103,12 @@ jobs:
           python-version: "3.12.15"
           enable-cache: true
       - run: uv sync --all-extras --frozen
+      - name: Check env imports under the dedicated scoring identity
+        run: |
+          sudo env RUN_EPISODE_LIVE=1 \
+            EPISODE_LIVE_IMAGE=registry.example/task@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+            "$PWD/.venv/bin/python" -m pytest -q \
+            tests/test_bridge_live.py::test_the_live_envs_import_as_a_scoring_uid
       - name: Exercise the miner harness through a signed gateway
         env:
           RUN_VERIFIERS_BRIDGE: "1"
