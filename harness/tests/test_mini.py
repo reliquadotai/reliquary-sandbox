@@ -123,3 +123,26 @@ def test_mini_renders_its_frozen_golden():
         if os.environ.get("HARNESS_WRITE_GOLDENS") == "1":
             path.write_text(json.dumps(got, ensure_ascii=False, indent=1, sort_keys=True) + "\n", encoding="utf-8")
         assert got == json.loads(path.read_text(encoding="utf-8"))
+
+
+@needs_tokenizer
+def test_a_turn_closed_inside_its_reasoning_is_a_format_error_and_bridges():
+    """The model ends its turn before leaving its reasoning: no action, so mini's format
+    error, and the episode goes on (renderers 0.1.11 bridges it; 0.1.12 would not)."""
+    r = _renderer(next(iter(TOKENIZERS.values())))
+    prompt = r.initial_ids(TASK)
+    completion = _turn(r, "I keep thinking and never answer")
+    assert r.reasoning_unclosed(prompt, completion)
+    assert r.tool_calls(completion) == [(mini.FORMAT_ERROR_CALL, '{"found": 0}')]
+    following = r.next_prompt(prompt, completion, [mini.refusal(mini.FORMAT_ERROR_CALL, '{"found": 0}')])
+    assert following is not None and following[:len(prompt) + len(completion)] == prompt + completion
+
+
+def test_another_renderers_release_is_refused(monkeypatch):
+    import importlib.metadata
+
+    from reliquary_harness import qwen
+
+    monkeypatch.setattr(importlib.metadata, "version", lambda name: "0.1.12")
+    with pytest.raises(ValueError, match=r"renderers==0\.1\.11, not the installed 0\.1\.12"):
+        qwen.build_renderer("/nonexistent", MINI_SWE_V1)

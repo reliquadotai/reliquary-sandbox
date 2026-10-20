@@ -62,6 +62,9 @@ def _locked(method):
     return wrapper
 
 
+RENDERERS_VERSION = "0.1.11"
+"""The `renderers` release every spec's renderer (`renderers:qwen38@0.1.11`) is."""
+
 HIDDEN_PREFIX = "?"
 """A call to a canonical tool name the variant does not show is read as `?<name>`: a tool
 nobody offers (`not_offered`), so a hidden name is never executed."""
@@ -306,6 +309,13 @@ def build_renderer(checkpoint_dir: str, spec: HarnessSpec = BASH_VF_B2E4E81):
     client builds it (`create_renderer(load_tokenizer(model), Qwen38RendererConfig())`)."""
     if spec.renderer != "renderers:qwen38@0.1.11":
         raise ValueError(f"{spec.key} renders with {spec.renderer}, not the Qwen3.8 renderer")
+    # The digest pins this package's sources, not the renderer's: another `renderers` release
+    # renders or bridges other tokens (0.1.12 refuses to bridge a turn closed inside its reasoning).
+    from importlib.metadata import version
+
+    installed = version("renderers")
+    if installed != RENDERERS_VERSION:
+        raise ValueError(f"{spec.key} renders with renderers=={RENDERERS_VERSION}, not the installed {installed}")
     from renderers import create_renderer
     from renderers.base import load_tokenizer
     from renderers.configs import Qwen38RendererConfig
@@ -320,5 +330,5 @@ def load_turn_renderer(checkpoint_dir: str, tools=("bash", "edit"), *, spec: Har
                             refuse=refuse)
 
 
-__all__ = ["HIDDEN_PREFIX", "QwenTurnRenderer", "UnparsableSpan", "build_renderer", "calls_with_ids", "load_turn_renderer",
-           "pinned_tool_calls"]
+__all__ = ["HIDDEN_PREFIX", "QwenTurnRenderer", "RENDERERS_VERSION", "UnparsableSpan", "build_renderer", "calls_with_ids",
+           "load_turn_renderer", "pinned_tool_calls"]
