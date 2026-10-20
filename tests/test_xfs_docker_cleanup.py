@@ -24,6 +24,7 @@ def test_cleanup_targets_only_its_daemon_and_preserves_failures(
     attempts=0
     BRIDGE_MARKER="$TRACE.no-bridge"
     ours() { [ "$stopped" = 0 ] && echo 42; }
+    daemon_identity() { [ "$stopped" = 0 ] && echo 100; }
     docker() {
       printf 'docker %s\n' "$*" >> "$TRACE"
       [ "$1" = -H ] && [ "$2" = "unix://$SOCK" ] || return 90
@@ -64,7 +65,7 @@ def test_cleanup_targets_only_its_daemon_and_preserves_failures(
         assert len(removals) == 2
         assert events.index(removals[-1]) < events.index("kill 42")
         attempts = [event for event in events if event.startswith("umount ")]
-        assert len(attempts) == min(busy_attempts + 1, 10)
+        assert len(attempts) == min(busy_attempts + 1, 60)
         assert events.index("kill 42") < events.index(attempts[0])
         if expected_code:
             assert "could not unmount" in result.stderr

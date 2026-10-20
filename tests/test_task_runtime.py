@@ -109,7 +109,8 @@ class Box:
 
 class FakeDocker:
     def __init__(self):
-        self.info_value = {"OSType": "linux", "Runtimes": {"runsc": {"path": "/usr/bin/runsc"}}, "Driver": "overlay2", "NCPU": 8,
+        self.info_value = {"OSType": "linux", "Runtimes": {"runsc": {
+            "path": "/usr/bin/runsc", "runtimeArgs": ["--overlay2=none"]}}, "Driver": "overlay2", "NCPU": 8,
                            "DriverStatus": [["Backing Filesystem", "xfs"], ["Supports d_type", "true"]]}
         self.images_value = {IMAGE}
         self.created = []
@@ -337,6 +338,34 @@ def test_preflight_test_flag_skips_quota_checks(runtime):
     assert runtime.preflight()["disk_quota"] == "disabled"
 
 
+@pytest.mark.parametrize("args", [
+    [], ["--debug"], ["--overlay2=root:self"], ["--overlay2=all:memory"],
+    ["--overlay2", "none"], ["--overlay2=none", "--overlay"],
+    ["--overlay2=none", "--overlay=true"],
+    ["--overlay2=none", "-overlay=true"],
+    ["--overlay2=none", "-overlay2=root:self"],
+    ["--overlay2=none", "--overlay2=root:self"],
+    ["--overlay2=root:self", "--overlay2=none"],
+])
+def test_quoted_disks_require_an_unambiguous_direct_writable_layer(runtime, args):
+    runtime.client.info_value["Runtimes"]["runsc"]["runtimeArgs"] = args
+    with pytest.raises(RuntimeUnavailable, match="--overlay2=none"):
+        runtime.preflight()
+    assert runtime.client.created == []
+
+
+def test_direct_writable_layer_allows_unrelated_runtime_flags(runtime):
+    runtime.client.info_value["Runtimes"]["runsc"]["runtimeArgs"] = [
+        "--debug", "--overlay2=none"]
+    assert runtime.preflight()["disk_quota"] == "xfs-pquota"
+
+
+def test_unquoted_test_hosts_can_keep_the_runtime_default_overlay(runtime):
+    runtime.settings.episode_allow_unquoted_disk = True
+    runtime.client.info_value["Runtimes"]["runsc"].pop("runtimeArgs")
+    assert runtime.preflight()["disk_quota"] == "disabled"
+
+
 def test_episode_boxes_and_tenant_guests_never_reconcile_each_other(runtime, tmp_path):
     runtime.create("s-1", "s-1", spec())
     tenant = DockerRuntime(SimpleNamespace(state_dir=tmp_path), client=runtime.client)
@@ -431,12 +460,13 @@ def test_boxes_only_run_under_runsc(runtime):
         runtime.create("s-1", "s-1", spec())
 
 
-def test_preflight_pins_the_runsc_version_and_refuses_ignore_cgroups(runtime, monkeypatch):
+@pytest.mark.parametrize("argument", ["--ignore-cgroups", "-ignore-cgroups"])
+def test_preflight_pins_the_runsc_version_and_refuses_ignore_cgroups(runtime, monkeypatch, argument):
     monkeypatch.setattr(runtime, "_runsc_version", lambda path: "release-20250101.0")
     with pytest.raises(RuntimeUnavailable):
         runtime.preflight()
     monkeypatch.setattr(runtime, "_runsc_version", lambda path: "release-20260928.0")
-    runtime.client.info_value["Runtimes"]["runsc"]["runtimeArgs"] = ["--ignore-cgroups"]
+    runtime.client.info_value["Runtimes"]["runsc"]["runtimeArgs"] = ["--overlay2=none", argument]
     with pytest.raises(RuntimeUnavailable):
         runtime.preflight()
 

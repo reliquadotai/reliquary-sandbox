@@ -220,8 +220,8 @@ runner that finished; the controller requires it and its status."""
 #   so a flood is capped inside the box while the command still runs to the end
 #   and the controller can tell exactly whether it was truncated. The runner
 #   holds the output FIFOs open (O_RDWR) until the command is gone, so the
-#   command never blocks on open. A final open/close of the intermediate FIFOs
-#   guarantees `head` sees EOF even if its `cat` was killed before it opened.
+#   command never blocks on open. Intermediate FIFO readers are opened before
+#   cappers start, so even a late capper can drain and see EOF after relay exit.
 # * Once the command is reaped the cappers get ~1.5 s to drain, then their
 #   FIFO readers (`cat`, not the agent's processes) are killed so `head` sees
 #   EOF and flushes what it holds: a background service or a setsid escapee
@@ -241,30 +241,32 @@ if [ -e "$d/$id.killed" ]; then cleanup; printf 'RQ-END %s %s' "$id" 137; exit 1
 $B mkfifo "$d/$id.out" "$d/$id.err" "$d/$id.o2" "$d/$id.e2" || refuse
 ( exec 4<>"$d/$id.out" 5<>"$d/$id.err" ) || refuse
 exec 4<>"$d/$id.out" 5<>"$d/$id.err"
-$B cat <"$d/$id.out" >"$d/$id.o2" 4>&- 5>&- &
+exec 6<>"$d/$id.o2" 7<>"$d/$id.e2"
+exec 8<"$d/$id.o2" 9<"$d/$id.e2"
+$B cat <"$d/$id.out" >"$d/$id.o2" 4>&- 5>&- 6>&- 7>&- 8>&- 9>&- &
 r1=$!
-{ $B head -c "$n"; $B cat >/dev/null; : > "$d/$id.d1"; } <"$d/$id.o2" 4>&- 5>&- &
+{ $B head -c "$n"; $B cat >/dev/null; : > "$d/$id.d1"; } <&8 4>&- 5>&- 6>&- 7>&- 8>&- 9>&- &
 c1=$!
-$B cat <"$d/$id.err" >"$d/$id.e2" 4>&- 5>&- &
+$B cat <"$d/$id.err" >"$d/$id.e2" 4>&- 5>&- 6>&- 7>&- 8>&- 9>&- &
 r2=$!
-{ $B head -c "$n"; $B cat >/dev/null; : > "$d/$id.d2"; } <"$d/$id.e2" >&3 4>&- 5>&- &
+{ $B head -c "$n"; $B cat >/dev/null; : > "$d/$id.d2"; } <&9 >&3 4>&- 5>&- 6>&- 7>&- 8>&- 9>&- &
 c2=$!
+exec 8<&- 9<&-
 (
   cd -- "$4" 2>/dev/null || { echo "bash: cd: $4: No such file or directory" >&2; exit 1; }
   exec $B setsid /bin/bash -c "$3"
-) </dev/null >"$d/$id.out" 2>"$d/$id.err" 3>&- 4>&- 5>&- &
+) </dev/null >"$d/$id.out" 2>"$d/$id.err" 3>&- 4>&- 5>&- 6>&- 7>&- &
 child=$!
 printf '%s' "$child" > "$pg" || { $B kill -s KILL -- "-$child"; wait "$child"; refuse; }
 [ -e "$d/$id.killed" ] && $B kill -s KILL -- "-$child"
 wait "$child"
 status=$?
-exec 4>&- 5>&-
+exec 4>&- 5>&- 6>&- 7>&-
 i=0
 while [ "$i" -lt 15 ] && { [ ! -e "$d/$id.d1" ] || [ ! -e "$d/$id.d2" ]; }; do
   $B sleep 0.1; i=$((i+1))
 done
 $B kill -s KILL "$r1" "$r2" 2>/dev/null
-( exec 8<>"$d/$id.o2" 9<>"$d/$id.e2" )
 wait "$c1" "$c2"
 cleanup
 printf 'RQ-END %s %s' "$id" "$status"
@@ -658,8 +660,15 @@ class TaskBoxRuntime:
 
     def _check_runsc(self, configured: dict[str, Any]) -> str | None:
         """The pinned runsc version, once checked (None when no version is pinned)."""
-        if any(str(arg).startswith("--ignore-cgroups") for arg in configured.get("runtimeArgs") or []):
+        args = [str(arg) for arg in configured.get("runtimeArgs") or []]
+        if any(arg.lstrip("-").startswith("ignore-cgroups") for arg in args):
             raise InfraUnavailable("runsc must not run with --ignore-cgroups")
+        if not self.settings.episode_allow_unquoted_disk:
+            # Docker's XFS project quota owns the writable layer. Keep writes
+            # on that layer rather than adding a separate runsc overlay.
+            overlays = [arg for arg in args if arg.startswith(("--overlay", "-overlay"))]
+            if not overlays or any(arg != "--overlay2=none" for arg in overlays):
+                raise InfraUnavailable("Quoted episode disks require runsc --overlay2=none")
         wanted = getattr(self.settings, "episode_runsc_version", "")
         if not wanted:
             return None
@@ -1099,15 +1108,26 @@ class TaskBoxRuntime:
             stream.close()
             return
         self._connections[exec_id] = stream
+        sender = None
+        send_errors: list[Exception] = []
         try:
             # An abort that ran before the registration above left only this flag.
             if abandon is not None and abandon.is_set():
                 return
             if stdin is not None:
-                try:
-                    stream.send_stdin(stdin)
-                except OSError:
-                    pass  # the reader quit early (EPIPE): its exit code tells why
+                def send() -> None:
+                    try:
+                        stream.send_stdin(stdin)
+                    except OSError:
+                        pass  # the reader quit early: its exit code tells why
+                    except Exception as exc:
+                        send_errors.append(exc)
+                        stream.close()  # wake the output reader on a local failure
+
+                # Output must drain while a large input is being sent: the peer
+                # can fill its output buffer or stop reading before stdin ends.
+                sender = threading.Thread(target=send, daemon=True)
+                sender.start()
             try:
                 for kind, chunk in stream.frames():
                     yield ((chunk, None) if kind == STDOUT
@@ -1116,6 +1136,10 @@ class TaskBoxRuntime:
                 pass  # the peer closed with our input unread: the exit code tells why
         finally:
             self._abort(exec_id)
+            if sender is not None:
+                sender.join(1)
+                if send_errors:
+                    raise send_errors[0]
 
     def exec(self, box_id: str, argv: list[str], *, timeout_s: float, output_limit: int,
              stdin: bytes | None = None, env: dict[str, str] | None = None,

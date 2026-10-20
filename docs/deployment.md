@@ -87,7 +87,7 @@ Settings below use the `RELIQUARY_SANDBOX_` prefix, like every other controller 
 
 ### Host requirements
 
-- Linux with Docker Engine on a Unix socket, and the pinned gVisor runtime: `sudo ./scripts/bootstrap-runtime.sh --configure-docker` installs runsc `20260928.0` (SHA-512 checked). Keep `REQUIRE_GVISOR=true`. The controller compares `runsc --version` with `EPISODE_RUNSC_VERSION` and refuses `--ignore-cgroups`.
+- Linux with Docker Engine on a Unix socket, and the pinned gVisor runtime: `sudo ./scripts/bootstrap-runtime.sh --configure-docker` installs runsc `20260928.0` (SHA-512 checked) with `--overlay2=none`. Keep `REQUIRE_GVISOR=true`. The controller compares `runsc --version` with `EPISODE_RUNSC_VERSION` and refuses `--ignore-cgroups`. Quoted episode disks require the explicit `--overlay2=none` runtime argument with no conflicting overlay flags, so writes use Docker's quota-controlled layer. Qualify this configuration on a new or drained host before rollout.
 - Docker's data-root on xfs mounted with `pquota`, with the `overlay2` storage driver and the containerd image store disabled. The controller caps each box's writable root with `--storage-opt size=<disk budget>`. Preflight refuses to enable episodes unless `docker info` reports `overlay2` on xfs and a probe container created with a size option is accepted. `EPISODE_ALLOW_UNQUOTED_DISK=true` skips the check and the quota; use it for tests only.
 - A static busybox, at least 1.36, pinned by SHA-256 (`EPISODE_HELPER_BUSYBOX`, `EPISODE_HELPER_BUSYBOX_SHA256`). See "Episode hosts: the helper busybox".
 - The controller must see the Docker pidfile (`EPISODE_DOCKER_PIDFILE`, default `/var/run/docker.pid`) and `/proc`, so it can tell a daemon restart from an agent's action. A controller in a container needs both mounted read-only, and the host's `runsc` at the path Docker reports.
@@ -101,7 +101,7 @@ Settings below use the `RELIQUARY_SANDBOX_` prefix, like every other controller 
 {
   "storage-driver": "overlay2",
   "features": {"containerd-snapshotter": false},
-  "runtimes": {"runsc": {"path": "/usr/local/bin/runsc"}}
+  "runtimes": {"runsc": {"path": "/usr/local/bin/runsc", "runtimeArgs": ["--overlay2=none"]}}
 }
 ```
 
@@ -218,7 +218,7 @@ The fault rule: a failure is an `InfraFault` (ours, `aborted`) only when Docker 
 - A call's `cpu_ms` is the change in the box cgroup's CPU usage since the previous charge, read from Docker one-shot stats. When the controller runs on the host, `EPISODE_CPU_SOURCE=cgroupfs` reads `cpu.stat` under `EPISODE_CGROUP_ROOT` instead. The figure covers every process in the box, including gVisor's Sentry and gofer, so background jobs left by earlier calls are charged to the next call. CPU burnt after the last call is charged at `finish`. The `cpu_s` budget counts calls only; the final record's `cpu_total_ms` adds the grading box's CPU. Preparation is not counted.
 - At `finish`, before extract, every process the agent left in its box is killed (as root, with the helper busybox; PID 1 and the entrypoint stay), so the extracted state is final and nothing tampers with extraction.
 - A grading box must be created, and its CPU read once, within `EPISODE_GRADING_CREATE_TIMEOUT_S`; otherwise that attempt fails on our side (retried, then `aborted`). The bound leaves each grading step its full timeout inside the verification window, so a step cut by the window always follows our own slowness.
-- Files move through `docker exec` from the helper busybox, never `docker cp`: under runsc the box's root overlay lives inside the sandbox, where `docker cp` cannot see it.
+- Files move through `docker exec` from the helper busybox, preserving the box's user and file-operation checks. Quoted disks write directly to Docker's quota-controlled layer with `--overlay2=none`.
 
 ### Restarts
 
@@ -318,7 +318,7 @@ Under runsc, a loaded host sometimes fails to start a command in a box that is o
 OCI runtime exec failed: <path>/runsc did not terminate successfully: exit status N
 ```
 
-Only that exact message counts (anchored at both ends, nothing on stderr, no helper frame marker); text an agent or helper echoes never does. `<path>` is `.../runsc`, or the wrapper dockerd generates when the daemon configures `runtimeArgs` for the runtime: `<data-root>/runtimes/runsc.<hash>`. The detector accepts that wrapper, but never configure runsc flags through dockerd `runtimeArgs` without checking the detector against your daemon's actual message first (`--ignore-cgroups` is refused outright).
+Only that exact message counts (anchored at both ends, nothing on stderr, no helper frame marker); text an agent or helper echoes never does. `<path>` is `.../runsc`, or the wrapper dockerd generates when the daemon configures `runtimeArgs` for the runtime: `<data-root>/runtimes/runsc.<hash>`. The detector accepts that wrapper. Keep the required `--overlay2=none` argument and requalify any additional runtime arguments on the test host (`--ignore-cgroups` is refused outright).
 
 What the service does with it:
 
@@ -436,7 +436,7 @@ Measured live (Docker 29.1.3, runsc `release-20260928.0`, busybox-static 1.37, `
   1.8 s measured); the output the command printed before the timeout is kept (the runner's `head` buffers it until
   it drains).
   A call that leaves a background job or a `setsid` escapee returns in about 1.8 s.
-* **Disk quota.** On overlay2 over xfs `pquota`, a 256 MiB box stops at 255 MiB with `ENOSPC` inside the box (the
+* **Disk quota.** With runsc `--overlay2=none` on Docker overlay2 over xfs `pquota`, a 256 MiB box stops at its quota with `ENOSPC` inside the box (the
   Sentry keeps running), deleting frees the space, and the read-only `/etc/hosts`, `/etc/hostname`,
   `/etc/resolv.conf` and `/.reliquary` binds refuse writes (`EROFS`, `EBUSY` on rename, `ETXTBSY` on overwrite).
 * **Cost.** Median on a 2 vCPU host shared with another workload: open (create + prepare) 0.6 s, bash call 0.26 s,
