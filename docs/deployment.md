@@ -365,6 +365,8 @@ when set. Validators take a machine's address from their directory, never from a
 
 `episode_grading_cpu_millis_total` and `episode_grading_memory_bytes_total` (both or neither; required with the reservation totals): the grading pool. Each grading attempt's box (the task's CPUs and the token's memory) runs only inside it, entered after extract; waiters are served fairly by hotkey (the one holding the least of the pool first). A grading that cannot start while its grade step still fits is aborted by the machine: `the grading pool stayed full` when other miners' gradings held the pool (validators charge nobody and count it toward no cap), `the grading pool stayed full with this miner's own gradings` when the session's own hotkey held more than half of it (an ordinary abort). Size it at qualification so that `grading_pool.timeouts` stays at zero at the declared capacity; the signed report's `grading_pool` block shows its use, its waits and its timeouts.
 
+A new episode is refused before preparation when its grading box could never fit the configured grading pool. Closing an episode does not release resources still occupied by a container whose removal failed: agent reservations and grading pool shares remain held until cleanup succeeds, including across controller restarts. On slot-only hosts, any leftover episode box keeps its slot occupied. The periodic cleanup retries removal and releases each hold once.
+
 ## Episode hosts: the helper busybox
 
 Every plumbing command inside a task box (the bash runner, the kill, file reads and writes, the type check,
@@ -457,6 +459,8 @@ The suite also reads the env's package statically and fails it when it imports a
 (`RUN_EPISODE_LIVE=1`, marker `live`) and must never run on a production machine. Run it sequentially, as root on
 the test host, once against the main daemon (whose storage is refused by preflight; the tests set
 `episode_allow_unquoted_disk`) and once against the isolated xfs daemon, which also runs the quota test:
+
+CI also runs `test_episode_resources_live.py` and `test_bridge_live.py` against the isolated XFS daemon as root, with project quotas and cgroup accounting enabled. This job fails if any selected live test is skipped. It separately runs `test_verifiers_bridge_live.py`, using the real miner harness with a local scripted model and signed gateway. These test hosts use temporary state and generated keys; they do not connect to production gateways.
 
 ```bash
 RUN_EPISODE_LIVE=1 uv run pytest -q -s -m live tests/test_episode_live.py

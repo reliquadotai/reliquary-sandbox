@@ -7,11 +7,14 @@ import threading
 import time
 from types import SimpleNamespace
 
+import pytest
 from episode_fixtures import IMAGE, budgets
 from episode_manager_fixtures import build
 from fake_boxes import FakeBoxes
 from fake_episode_env import sandbox_task
+from fastapi import HTTPException
 
+from reliquary_sandbox.episode_client import decode_open_refusal
 from reliquary_sandbox_service.episodes.capacity import capacity_report
 from reliquary_sandbox_service.episodes.grader import Grader
 from reliquary_sandbox_service.episodes.resources import (
@@ -51,6 +54,32 @@ def test_a_box_larger_than_the_pool_never_waits():
     started = time.monotonic()
     assert pool.acquire(Reservation(2_000, GIB), 5.0, "a") == GRADING_POOL_FULL
     assert time.monotonic() - started < 1.0 and pool.snapshot()["timeouts"] == 1
+
+
+def test_restoring_the_same_cleanup_hold_twice_counts_it_once():
+    grader = Grader(SimpleNamespace(), FakeBoxes([IMAGE]))
+    grader.pool = GradingPool(Reservation(1_000, 4 * GIB))
+    for _ in range(2):
+        grader.retain_cleanup("leftover", SHARE, "owner", restore=True)
+    assert grader.pool.snapshot()["used_cpu_millis"] == SHARE.cpu_millis
+    assert grader.pool.acquire(SHARE, 0, "other") == GRADING_POOL_FULL
+    for _ in range(2):
+        grader.release_cleanup("leftover")
+    assert grader.pool.snapshot()["used_cpu_millis"] == 0
+
+
+def test_releasing_cleanup_preserves_the_miners_other_active_grading_ownership():
+    pool = GradingPool(Reservation(2_000, 4 * GIB))
+    active, cleanup = Reservation(1_100, GIB), Reservation(500, GIB)
+    assert pool.acquire(active, 0, "miner") is None
+    assert pool.acquire(cleanup, 0, "miner") is None
+    pool.disown(cleanup, "miner")
+    assert pool.snapshot()["used_cpu_millis"] == active.cpu_millis + cleanup.cpu_millis
+    pool.release(cleanup, None)
+    assert pool.snapshot()["used_cpu_millis"] == active.cpu_millis
+    assert pool.acquire(active, 0, "miner") == GRADING_POOL_OWN
+    pool.release(active, "miner")
+    assert pool.snapshot()["used_cpu_millis"] == 0
 
 
 def test_a_timeout_says_whose_gradings_held_the_pool():
@@ -131,10 +160,29 @@ def test_the_pool_is_taken_after_extract_by_the_sessions_hotkey(tmp_path):
 
 
 def test_a_full_pool_aborts_the_grading_as_the_machines_doing(tmp_path):
-    h = harness(tmp_path, episode_grading_cpu_millis_total=100)     # a 500-millis grading box never fits
+    h = harness(tmp_path)
     key = h.open("s-1", index=7, budgets=budgets(memory_bytes=3 * GIB))["episode_key"]
+    # Already-open episodes keep their established finish behavior if the pool changes.
+    h.manager.grading_pool.total = Reservation(100, 8 * GIB)
     final = h.manager.finish("s-1", key)["record"]["body"]
     assert final["status"] == "aborted" and final["reason"] == GRADING_POOL_FULL
+
+
+@pytest.mark.parametrize("limits", [dict(episode_grading_cpu_millis_total=100),
+                                   dict(episode_grading_memory_bytes_total=2 * GIB)])
+def test_a_task_that_cannot_ever_fit_the_grading_pool_is_refused_before_work(tmp_path, limits):
+    h = harness(tmp_path, **limits)
+    token = h.token("s-1", index=7, budgets=budgets(memory_bytes=3 * GIB))
+    with pytest.raises(HTTPException) as error:
+        h.manager.open(token)
+    assert error.value.status_code == 422 and "grading pool" in error.value.detail
+    receipt = decode_open_refusal(error.value.headers["X-Reliquary-Open-Refusal"])
+    assert receipt["document"]["reason"] == "task_refused"
+    assert h.boxes.boxes == {} and h.manager.active_count() == 0
+    with pytest.raises(HTTPException) as repeated:
+        h.manager.open(token)
+    assert repeated.value.status_code == 409
+    assert repeated.value.headers == error.value.headers
 
 
 def test_the_report_shows_the_pool(tmp_path):
@@ -172,4 +220,7 @@ def test_a_grading_box_that_could_not_be_removed_stops_the_retries():
     assert outcome.status == "aborted" and "could not be removed" in outcome.reason
     assert calls == [Grader.pristine_box_id("s-1", 0)]                     # no second box beside it
     assert outcome.cleanup == (Grader.pristine_box_id("s-1", 0),)
-    assert grader.pool.snapshot()["used_cpu_millis"] == 0                  # its share went back
+    assert grader.pool.snapshot()["used_cpu_millis"] == 500                # the box still holds it
+    grader.release_cleanup(outcome.cleanup[0])
+    grader.release_cleanup(outcome.cleanup[0])                             # duplicate cleanup is harmless
+    assert grader.pool.snapshot()["used_cpu_millis"] == 0

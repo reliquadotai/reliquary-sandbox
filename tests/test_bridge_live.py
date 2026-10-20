@@ -24,6 +24,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -41,6 +42,7 @@ from reliquary_sandbox_service.episodes.conformance import (  # noqa: E402
 from reliquary_sandbox_service.episodes.conformance_cli import main  # noqa: E402
 from reliquary_sandbox_service.episodes.local_gateway import local_gateway  # noqa: E402
 from reliquary_sandbox_service.episodes.registry import TaskRegistry  # noqa: E402
+from reliquary_sandbox_service.scoring_server import DEFAULT_UID_BASE  # noqa: E402
 
 needs_live = pytest.mark.skipif(os.getenv("RUN_EPISODE_LIVE") != "1",
                                 reason="set RUN_EPISODE_LIVE=1 on the episode test host")
@@ -130,6 +132,43 @@ def gateway_settings():
                 episode_helper_busybox_sha256=hashlib.sha256(BUSYBOX.read_bytes()).hexdigest(),
                 episode_docker_pidfile=PIDFILE, episode_cpu_source=CPU_SOURCE,
                 episode_allow_unquoted_disk=not XFS)
+
+
+@pytest.mark.live
+@needs_live
+@pytest.mark.skipif(os.geteuid() != 0, reason="root is required to start a dedicated scoring uid")
+def test_the_live_envs_import_as_a_scoring_uid(envs):
+    """The interpreter, installed dependencies and env data must survive the uid drop.
+
+    Loading as root alone cannot prove that the scoring process can read its files.
+    A fresh interpreter also checks imports the forkserver may already have cached.
+    """
+    code = """
+import json, os, sys
+from pathlib import Path
+assert os.getuid() == os.geteuid() == int(sys.argv[3])
+assert os.getgid() == os.getegid() == int(sys.argv[3])
+assert os.getgroups() == []
+sys.path[:] = json.loads(sys.argv[1])
+from reliquary_sandbox_service.episodes.registry import TaskRegistry
+registry = TaskRegistry(json.loads(sys.argv[2]))
+for env in registry.versions():
+    registry.resolve(env, "rl", 0)
+    task = registry.bridged(env).task("rl", 0)
+    if hasattr(task.data, "task_dir"):
+        assert (Path(task.data.task_dir) / "tests" / "test.sh").read_bytes()
+"""
+    with tempfile.TemporaryDirectory(prefix="scoring-imports-") as tmpdir:
+        os.chown(tmpdir, DEFAULT_UID_BASE, DEFAULT_UID_BASE)
+        result = subprocess.run(
+            [sys.executable, "-c", code, json.dumps(sys.path), json.dumps(envs), str(DEFAULT_UID_BASE)],
+            user=DEFAULT_UID_BASE, group=DEFAULT_UID_BASE, extra_groups=[],
+            cwd=tmpdir, env={"PATH": f"{Path(sys.executable).parent}:/usr/local/bin:/usr/bin:/bin",
+                             "LANG": "C.UTF-8", "HOME": "/nonexistent", "TMPDIR": tmpdir,
+                             "PYTHONHASHSEED": "0", "OPENBLAS_NUM_THREADS": "1",
+                             "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"},
+            capture_output=True, text=True, timeout=60, check=False)
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.mark.live

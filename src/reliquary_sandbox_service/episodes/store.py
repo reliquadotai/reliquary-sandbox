@@ -115,6 +115,21 @@ class EpisodeStore:
                 "SELECT payload FROM episodes WHERE status != ?", (CLOSED,)).fetchall()
         return [json.loads(row[0]) for row in rows]
 
+    def reserving(self, *, include_grading: bool = False) -> list[dict[str, Any]]:
+        """Live episodes and closed episodes whose boxes still hold capacity.
+
+        Closing a transcript does not free a box's resources: only its removal does.
+        Include grading leftovers too on slot-only hosts without a grading pool.
+        Read both kinds in one snapshot so a close cannot disappear between queries.
+        """
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT payload FROM episodes WHERE status != ? OR has_cleanup = 1",
+                (CLOSED,)).fetchall()
+        episodes = [json.loads(row[0]) for row in rows]
+        return [episode for episode in episodes if episode["status"] != CLOSED
+                or include_grading or episode["box_id"] in episode.get("cleanup", ())]
+
     def with_cleanup(self) -> list[dict[str, Any]]:
         with self.lock:
             rows = self.db.execute(
