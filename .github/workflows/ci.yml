@@ -92,8 +92,17 @@ jobs:
   signed-episodes:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: /opt/reliquary-sandbox-checks
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Prepare a checkout readable by dedicated scoring identities
+        working-directory: ${{ github.workspace }}
+        run: |
+          umask 022
+          sudo install -d -m 0755 -o "$(id -u)" -g "$(id -g)" /opt/reliquary-sandbox-checks
+          git archive HEAD | tar -x -C /opt/reliquary-sandbox-checks
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12.15"
@@ -150,4 +159,5 @@ jobs:
           PY
       - name: Stop the isolated test daemon
         if: always()
+        working-directory: ${{ github.workspace }}
         run: sudo ./scripts/test-xfs-docker.sh purge
