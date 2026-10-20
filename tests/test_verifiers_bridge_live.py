@@ -1,7 +1,7 @@
 """verifiers' real bash program, a scripted fake model and a local gateway over FakeBoxes.
 The text the model sees for each call must be the pinned rendering of the signed record
 (the miner/validator parity check). Opt-in: RUN_VERIFIERS_BRIDGE=1. It prepares the
-program with uv (network), so it runs on a dev host but not in CI."""
+program with uv (network), so it runs in the signed-episode CI job or on a dev host."""
 
 import os
 

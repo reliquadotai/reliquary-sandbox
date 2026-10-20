@@ -88,3 +88,76 @@ jobs:
           if [ -f .env ]; then
             docker compose down --volumes
           fi
+
+  signed-episodes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: /opt/reliquary-sandbox-checks
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Prepare a checkout readable by dedicated scoring identities
+        working-directory: ${{ github.workspace }}
+        run: |
+          umask 022
+          sudo install -d -m 0755 -o "$(id -u)" -g "$(id -g)" /opt/reliquary-sandbox-checks
+          git archive HEAD | tar -x -C /opt/reliquary-sandbox-checks
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12.15"
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          version: "0.11.10"
+          python-version: "3.12.15"
+          enable-cache: true
+      - run: uv sync --all-extras --frozen
+      - name: Check env imports under the dedicated scoring identity
+        run: |
+          sudo env RUN_EPISODE_LIVE=1 \
+            EPISODE_LIVE_IMAGE=registry.example/task@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+            "$PWD/.venv/bin/python" -m pytest -q \
+            tests/test_bridge_live.py::test_the_live_envs_import_as_a_scoring_uid
+      - name: Exercise the miner harness through a signed gateway
+        env:
+          RUN_VERIFIERS_BRIDGE: "1"
+        run: uv run pytest -q tests/test_verifiers_bridge_live.py
+      - name: Install the signed episode test host
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y busybox-static xfsprogs
+          sudo ./scripts/bootstrap-runtime.sh --configure-docker
+          sudo ./scripts/test-xfs-docker.sh up
+          sudo docker -H unix:///run/reliquary-xfs-docker.sock pull ubuntu:22.04
+      - name: Exercise signed episodes with production resource controls
+        env:
+          DOCKER_HOST: unix:///run/reliquary-xfs-docker.sock
+        run: |
+          sudo env \
+            DOCKER_HOST="$DOCKER_HOST" \
+            RUN_EPISODE_LIVE=1 \
+            EPISODE_LIVE_XFS=1 \
+            EPISODE_LIVE_DOCKER_PIDFILE=/run/reliquary-xfs-docker.pid \
+            EPISODE_LIVE_CPU_SOURCE=cgroupfs \
+            EPISODE_LIVE_BUSYBOX=/usr/bin/busybox \
+            "$PWD/.venv/bin/python" -m pytest -q -m live \
+            --junitxml="$RUNNER_TEMP/signed-episodes.xml" \
+            tests/test_episode_live.py \
+            tests/test_episode_resources_live.py \
+            tests/test_bridge_live.py
+          python - "$RUNNER_TEMP/signed-episodes.xml" <<'PY'
+          import sys
+          from xml.etree import ElementTree
+
+          suites = ElementTree.parse(sys.argv[1]).getroot().iter("testsuite")
+          counts = {key: 0 for key in ("tests", "failures", "errors", "skipped")}
+          for suite in suites:
+              for key in counts:
+                  counts[key] += int(suite.get(key, 0))
+          assert counts["tests"] > 0, counts
+          assert not any(counts[key] for key in ("failures", "errors", "skipped")), counts
+          PY
+      - name: Stop the isolated test daemon
+        if: always()
+        working-directory: ${{ github.workspace }}
+        run: sudo ./scripts/test-xfs-docker.sh purge

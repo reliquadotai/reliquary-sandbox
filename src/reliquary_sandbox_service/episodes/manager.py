@@ -60,7 +60,14 @@ from ..settings import transcript_reserve_bytes
 from ..task_runtime import BoxFault, BoxSpec, InfraFault
 from .grader import RETRY_MARGIN_S, Grader, run_step
 from .registry import TaskRegistry, TaskResolutionError, task_fingerprint
-from .resources import episode_reservation, grading_pool, in_use, resources_enabled, totals
+from .resources import (
+    cleanup_reservation,
+    episode_reservation,
+    grading_pool,
+    in_use,
+    resources_enabled,
+    totals,
+)
 from .store import (
     CLOSED,
     FINISHING,
@@ -205,6 +212,13 @@ class EpisodeManager:
         reported in the signed capacity report; set by the factory and readiness."""
         self.grading_pool = grading_pool(self.settings)
         self.grader.pool = self.grading_pool          # each grading attempt runs inside it
+        if self.grading_pool is not None:
+            for episode in self.store.with_cleanup():
+                for box_id in episode["cleanup"]:
+                    if box_id != episode["box_id"]:
+                        self.grader.retain_cleanup(
+                            box_id, cleanup_reservation(episode, settings, self.grading_pool.total),
+                            episode["claims"]["hotkey"], restore=True)
 
     # -- helpers -------------------------------------------------------------
 
@@ -378,14 +392,17 @@ class EpisodeManager:
 
     def _remove_boxes(self, episode: dict[str, Any], box_ids: list[str]) -> None:
         """Remove boxes now; the ones that could not be removed go to `cleanup` (the reaper)."""
-        pending = []
+        pending = set(episode.get("cleanup", ()))
         for box_id in box_ids:
             try:
                 self.boxes.remove(box_id)
             except Exception:
                 _log.warning("could not remove box %s", box_id, exc_info=True)
-                pending.append(box_id)
-        episode["cleanup"] = sorted(set(episode.get("cleanup", [])) | set(pending))
+                pending.add(box_id)
+            else:
+                pending.discard(box_id)
+                self.grader.release_cleanup(box_id)
+        episode["cleanup"] = sorted(pending)
 
     # -- open ----------------------------------------------------------------
 
@@ -449,6 +466,10 @@ class EpisodeManager:
                 claims, digest, token, 422,
                 "the task needs more CPUs per box than this machine gives", "task_refused")
         reserve = episode_reservation(self._nano_cpus(task), claims.budgets.memory_bytes)
+        if self.grading_pool is not None and not reserve.within(self.grading_pool.total):
+            raise self._refuse_signed(
+                claims, digest, token, 422,
+                "the task needs more CPU or memory than this machine's grading pool has", "task_refused")
         if accounted and not reserve.within(totals(self.settings)):
             raise self._refuse_signed(
                 claims, digest, token, 422,
@@ -473,7 +494,7 @@ class EpisodeManager:
             "open_by": now + math.ceil(task.prepare_timeout_s) + PREPARE_SLACK_S,
         }
         with self.lock:
-            active = self.store.active()
+            active = self.store.reserving(include_grading=self.grading_pool is None)
             if len(active) >= self.settings.episode_capacity:
                 raise self._refuse_signed(claims, digest, token, 503, "no free episode slot", "no_free_slot",
                                           {"Retry-After": RETRY_AFTER_S})
@@ -920,7 +941,7 @@ class EpisodeManager:
         return json.loads(self.transcript_json(episode_id, key))
 
     def active_count(self) -> int:
-        return len(self.store.active())
+        return len(self.store.reserving(include_grading=self.grading_pool is None))
 
     # -- background ----------------------------------------------------------
 
@@ -968,7 +989,9 @@ class EpisodeManager:
                     self._guarded(self._close, current, STATUS_ABORTED,
                                   reason="controller restart recovery failed")
         self._guarded(self._retry_cleanup)
-        self._guarded(self._remove_orphans)
+        # An untracked box that cannot be removed has no reservation to restore:
+        # startup must stop rather than serve with unknown resource use.
+        self._remove_orphans()
 
     @staticmethod
     def _guarded(step, *args, **kwargs) -> bool:
@@ -1097,12 +1120,37 @@ class EpisodeManager:
         not live is never one an open or a finish is still using."""
         managed = self.boxes.managed()
         live = {episode["id"] for episode in self.store.active()}
+        failed = False
         for box_id, episode_id in managed.items():
             if episode_id not in live:
                 try:
-                    self.boxes.remove(box_id)
+                    with self._exclusive(episode_id):
+                        episode = self.store.get(episode_id)
+                        if episode is not None:
+                            if episode["status"] != CLOSED:
+                                continue
+                            # A crash may precede the final cleanup save. Journal the
+                            # leftover before removing it, so a failed removal (or
+                            # another crash) cannot lose its resource reservation.
+                            episode["cleanup"] = sorted(set(episode.get("cleanup", ())) | {box_id})
+                            self.store.commit(episode)
+                            if self.grading_pool is not None and box_id != episode["box_id"]:
+                                self.grader.retain_cleanup(
+                                    box_id, cleanup_reservation(
+                                        episode, self.settings, self.grading_pool.total),
+                                    episode["claims"]["hotkey"], restore=True)
+                            self._remove_boxes(episode, [box_id])
+                            self.store.commit(episode)
+                        else:
+                            self.boxes.remove(box_id)
+                            self.grader.release_cleanup(box_id)
+                except HTTPException:
+                    continue  # an in-flight request owns this row; retry next sweep
                 except Exception:
+                    failed = True
                     _log.warning("could not remove leftover box %s", box_id, exc_info=True)
+        if failed:
+            raise RuntimeError("orphaned box cleanup incomplete")
 
     def _prune_locks(self) -> None:
         """Forget the locks of episodes that are no longer live. Read under
