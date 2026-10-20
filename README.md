@@ -118,6 +118,10 @@ Replace the IDs with the values returned by create and checkpoint. Restore keeps
 
 The SDK's broader client interfaces do not imply that every endpoint is provided by this deployment. Unsupported requests are rejected rather than silently downgraded.
 
+## Project history
+
+[0xgrizz](https://github.com/0xgrizz) delivered the initial Reliquary Sandbox implementation and `v0.1.0` release on 4 October 2026, including the SDK adaptation, CLI, self-hosted gVisor service, deployment tooling, and tests. The [original nine commits](https://github.com/reliquadotai/reliquary-sandbox/commits/66804e438538a9ab1451e3dfb9c7dcd9e6909757) retain their original authorship, dates, and IDs. Later work, including signed agentic episodes and the verifiers bridge, retains its contributor attribution in Git. Third-party licenses and copyright notices remain in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
 ## Development
 
 ```bash
