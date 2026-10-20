@@ -52,18 +52,36 @@ ours() {
 # Non-veth links as "name mac", sorted (states churn with the main daemon's containers).
 links() { ip -br link | awk '$1 !~ /^veth/ { sub(/@.*/, "", $1); print $1, $3 }' | sort; }
 
+unmount_with_retry() {
+  local target=$1 attempt
+  # Containerd can release a removed container's mounts after dockerd exits.
+  for attempt in $(seq 10); do
+    mountpoint -q "$target" || return 0
+    if umount "$target"; then return 0; fi
+    if [ "$attempt" -lt 10 ]; then sleep 1; fi
+  done
+  echo "could not unmount $target after 10 attempts" >&2
+  return 1
+}
+
 down() {
-  local pid
+  local pid containers container
   if pid=$(ours); then
+    containers=$(docker -H "unix://$SOCK" ps -aq)
+    if [ -n "$containers" ]; then
+      while IFS= read -r container; do
+        docker -H "unix://$SOCK" rm --force -- "$container" >/dev/null
+      done <<< "$containers"
+    fi
     kill "$pid"
     for _ in $(seq 60); do ours >/dev/null || break; sleep 1; done
     if ours >/dev/null; then echo "the daemon did not stop" >&2; exit 1; fi
   fi
   # What the daemon left mounted under its own exec-root (its null netns).
   { findmnt -rn -o TARGET | grep "^$EXEC_ROOT/" || true; } | sort -r | while read -r target; do
-    umount "$target"
+    unmount_with_retry "$target"
   done
-  if mountpoint -q "$ROOT/mnt"; then umount "$ROOT/mnt"; fi
+  unmount_with_retry "$ROOT/mnt"
   if [ -f "$BRIDGE_MARKER" ]; then
     if ip -d link show "$BRIDGE" >/dev/null 2>&1; then ip link del "$BRIDGE"; fi
     rm -f "$BRIDGE_MARKER"
