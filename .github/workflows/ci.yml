@@ -140,7 +140,7 @@ jobs:
             EPISODE_LIVE_DOCKER_PIDFILE=/run/reliquary-xfs-docker.pid \
             EPISODE_LIVE_CPU_SOURCE=cgroupfs \
             EPISODE_LIVE_BUSYBOX=/usr/bin/busybox \
-            "$PWD/.venv/bin/python" -m pytest -q -m live \
+            "$PWD/.venv/bin/python" -m pytest -q -m live --durations=10 \
             --junitxml="$RUNNER_TEMP/signed-episodes.xml" \
             tests/test_episode_live.py \
             tests/test_episode_resources_live.py \
@@ -157,6 +157,22 @@ jobs:
           assert counts["tests"] > 0, counts
           assert not any(counts[key] for key in ("failures", "errors", "skipped")), counts
           PY
+      - name: Repeat strict writable-root quota conformance
+        env:
+          DOCKER_HOST: unix:///run/reliquary-xfs-docker.sock
+        run: |
+          for pass in 1 2 3; do
+            echo "Quota conformance pass $pass/3"
+            sudo env \
+              DOCKER_HOST="$DOCKER_HOST" \
+              RUN_EPISODE_LIVE=1 \
+              EPISODE_LIVE_XFS=1 \
+              EPISODE_LIVE_DOCKER_PIDFILE=/run/reliquary-xfs-docker.pid \
+              EPISODE_LIVE_CPU_SOURCE=cgroupfs \
+              EPISODE_LIVE_BUSYBOX=/usr/bin/busybox \
+              "$PWD/.venv/bin/python" -m pytest -q -m live --durations=10 \
+              tests/test_episode_live.py::test_writable_root_is_capped_by_the_project_quota
+          done
       - name: Stop the isolated test daemon
         if: always()
         working-directory: ${{ github.workspace }}

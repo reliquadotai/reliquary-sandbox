@@ -302,28 +302,49 @@ def test_the_helper_directory_is_read_only(boxes, image):
     assert bash(boxes, box_id, "echo ok").stdout == b"ok\n"
 
 
+def _report_quota_failure(boxes, box_id, began):
+    """Capture this test box's exit evidence before fixture cleanup, without identifiers."""
+    try:
+        container = boxes._container(box_id)
+        container.reload()
+        raw = container.attrs["State"]
+        state = {key: raw.get(key) for key in (
+            "Status", "ExitCode", "OOMKilled", "StartedAt", "FinishedAt")}
+        state["Error"] = bool(raw.get("Error"))
+        report("quota_failure", elapsed_s=time.monotonic() - began, state=state,
+               cgroup={name: _cgroup_file(boxes, box_id, name) for name in (
+                   "memory.events", "memory.current", "pids.current", "pids.events")})
+    except Exception as exc:
+        report("quota_failure_inspection", error=type(exc).__name__)
+
+
 @pytest.mark.skipif(not XFS, reason="needs a Docker data-root on xfs with pquota")
 def test_writable_root_is_capped_by_the_project_quota(boxes, image):
     assert boxes.preflight()["disk_quota"] == "xfs-pquota"
+    began = time.monotonic()
     box_id = start(boxes, image, disk=256 * 1024**2)
-    result = bash(boxes, box_id, "dd if=/dev/zero of=/big bs=1M count=400 2>&1; echo rc=$?",
-                  timeout_s=120)
-    assert b"rc=0" not in result.stdout, result.stdout
-    assert b"No space left on device" in result.stdout, result.stdout
-    assert boxes.status(box_id) == "running"
-    stuck = bash(boxes, box_id, "sleep 1003", timeout_s=2)
-    assert stuck.timed_out
-    assert "sleep 1003" not in processes(boxes, box_id)
-    with pytest.raises(OSError) as full:
-        boxes.write_file(box_id, "/root/more.bin", os.urandom(64 * 1024**2))
-    assert full.value.errno == errno.ENOSPC, full.value
-    full_write = f"OSError errno={full.value.errno}"
-    assert bash(boxes, box_id, "rm -f /big /root/more.bin && echo ok").stdout == b"ok\n"
-    again = bash(boxes, box_id, "dd if=/dev/zero of=/again bs=1M count=100 2>&1; echo rc=$?",
-                 timeout_s=120)
-    report("quota", dd_400m=result.stdout.decode()[-200:], write_file_when_full=full_write,
-           dd_100m_after_rm=again.stdout.decode()[-120:])
-    assert b"rc=0" in again.stdout, again.stdout
+    try:
+        result = bash(boxes, box_id, "dd if=/dev/zero of=/big bs=1M count=400 2>&1; echo rc=$?",
+                      timeout_s=120)
+        assert b"rc=0" not in result.stdout, result.stdout
+        assert b"No space left on device" in result.stdout, result.stdout
+        assert boxes.status(box_id) == "running"
+        stuck = bash(boxes, box_id, "sleep 1003", timeout_s=2)
+        assert stuck.timed_out
+        assert "sleep 1003" not in processes(boxes, box_id)
+        with pytest.raises(OSError) as full:
+            boxes.write_file(box_id, "/root/more.bin", os.urandom(64 * 1024**2))
+        assert full.value.errno == errno.ENOSPC, full.value
+        full_write = f"OSError errno={full.value.errno}"
+        assert bash(boxes, box_id, "rm -f /big /root/more.bin && echo ok").stdout == b"ok\n"
+        again = bash(boxes, box_id, "dd if=/dev/zero of=/again bs=1M count=100 2>&1; echo rc=$?",
+                     timeout_s=120)
+        report("quota", dd_400m=result.stdout.decode()[-200:], write_file_when_full=full_write,
+               dd_100m_after_rm=again.stdout.decode()[-120:])
+        assert b"rc=0" in again.stdout, again.stdout
+    except Exception:
+        _report_quota_failure(boxes, box_id, began)
+        raise
 
 
 def _cgroup_file(boxes, box_id, name):
