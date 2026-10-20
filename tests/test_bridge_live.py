@@ -158,13 +158,16 @@ for env in registry.versions():
     if hasattr(task.data, "task_dir"):
         assert (Path(task.data.task_dir) / "tests" / "test.sh").read_bytes()
 """
-    result = subprocess.run(
-        [sys.executable, "-c", code, json.dumps(sys.path), json.dumps(envs), str(DEFAULT_UID_BASE)],
-        user=DEFAULT_UID_BASE, group=DEFAULT_UID_BASE, extra_groups=[],
-        cwd="/tmp", env={"PATH": f"{Path(sys.executable).parent}:/usr/local/bin:/usr/bin:/bin",
-                         "LANG": "C.UTF-8", "PYTHONHASHSEED": "0", "OPENBLAS_NUM_THREADS": "1",
-                         "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"},
-        capture_output=True, text=True, timeout=60, check=False)
+    with tempfile.TemporaryDirectory(prefix="scoring-imports-") as tmpdir:
+        os.chown(tmpdir, DEFAULT_UID_BASE, DEFAULT_UID_BASE)
+        result = subprocess.run(
+            [sys.executable, "-c", code, json.dumps(sys.path), json.dumps(envs), str(DEFAULT_UID_BASE)],
+            user=DEFAULT_UID_BASE, group=DEFAULT_UID_BASE, extra_groups=[],
+            cwd=tmpdir, env={"PATH": f"{Path(sys.executable).parent}:/usr/local/bin:/usr/bin:/bin",
+                             "LANG": "C.UTF-8", "HOME": "/nonexistent", "TMPDIR": tmpdir,
+                             "PYTHONHASHSEED": "0", "OPENBLAS_NUM_THREADS": "1",
+                             "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"},
+            capture_output=True, text=True, timeout=60, check=False)
     assert result.returncode == 0, result.stdout + result.stderr
 
 
