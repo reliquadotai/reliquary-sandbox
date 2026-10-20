@@ -326,6 +326,7 @@ def test_writable_root_is_capped_by_the_project_quota(boxes, image):
     try:
         result = bash(boxes, box_id, "dd if=/dev/zero of=/big bs=1M count=400 2>&1; echo rc=$?",
                       timeout_s=120)
+        assert not result.timed_out
         assert b"rc=0" not in result.stdout, result.stdout
         assert b"No space left on device" in result.stdout, result.stdout
         assert boxes.status(box_id) == "running"
@@ -339,6 +340,7 @@ def test_writable_root_is_capped_by_the_project_quota(boxes, image):
         assert bash(boxes, box_id, "rm -f /big /root/more.bin && echo ok").stdout == b"ok\n"
         again = bash(boxes, box_id, "dd if=/dev/zero of=/again bs=1M count=100 2>&1; echo rc=$?",
                      timeout_s=120)
+        assert not again.timed_out
         report("quota", dd_400m=result.stdout.decode()[-200:], write_file_when_full=full_write,
                dd_100m_after_rm=again.stdout.decode()[-120:])
         assert b"rc=0" in again.stdout, again.stdout

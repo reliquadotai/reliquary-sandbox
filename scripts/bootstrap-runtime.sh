@@ -48,9 +48,9 @@ tar --bzip2 --extract --file "${archive}" --directory /usr/local/bin --no-same-o
 if [[ "${1:-}" == "--configure-docker" ]]; then
   command -v docker >/dev/null || { echo "Install Docker before registering runsc." >&2; exit 1; }
   command -v systemctl >/dev/null || { echo "Docker registration requires systemd." >&2; exit 1; }
-  /usr/local/bin/runsc install
+  /usr/local/bin/runsc install -- --overlay2=none
   systemctl reload docker
   docker info --format '{{json .Runtimes}}'
 else
-  echo "Installed. Register with Docker using: sudo runsc install && sudo systemctl reload docker"
+  echo "Installed. Register with Docker using: sudo runsc install -- --overlay2=none && sudo systemctl reload docker"
 fi

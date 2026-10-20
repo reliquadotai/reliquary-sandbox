@@ -142,7 +142,7 @@ case "${1:-}" in
   "ip6tables": false,
   "ip-forward": false,
   "ip-masq": false,
-  "runtimes": {"runsc": {"path": "$RUNSC"}}
+  "runtimes": {"runsc": {"path": "$RUNSC", "runtimeArgs": ["--overlay2=none"]}}
 }
 JSON
     if ours >/dev/null; then

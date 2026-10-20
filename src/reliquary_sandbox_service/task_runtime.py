@@ -658,8 +658,15 @@ class TaskBoxRuntime:
 
     def _check_runsc(self, configured: dict[str, Any]) -> str | None:
         """The pinned runsc version, once checked (None when no version is pinned)."""
-        if any(str(arg).startswith("--ignore-cgroups") for arg in configured.get("runtimeArgs") or []):
+        args = [str(arg) for arg in configured.get("runtimeArgs") or []]
+        if any(arg.lstrip("-").startswith("ignore-cgroups") for arg in args):
             raise InfraUnavailable("runsc must not run with --ignore-cgroups")
+        if not self.settings.episode_allow_unquoted_disk:
+            # Docker's XFS project quota owns the writable layer. Keep writes
+            # on that layer rather than adding a separate runsc overlay.
+            overlays = [arg for arg in args if arg.startswith(("--overlay", "-overlay"))]
+            if not overlays or any(arg != "--overlay2=none" for arg in overlays):
+                raise InfraUnavailable("Quoted episode disks require runsc --overlay2=none")
         wanted = getattr(self.settings, "episode_runsc_version", "")
         if not wanted:
             return None
