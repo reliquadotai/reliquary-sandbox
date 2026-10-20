@@ -1306,13 +1306,22 @@ def test_an_argument_the_protocol_cannot_encode_fails_in_the_envs_code():
 class KillsItsForkserver(ToyTask):
     @vf.reward(weight=1.0)
     async def solved(self, runtime) -> float:
-        os.kill(os.getppid(), signal.SIGKILL)  # the forkserver (a host OOM kill)
+        parent = os.getppid()
+        os.kill(parent, signal.SIGKILL)  # the forkserver (a host OOM kill)
+        # Sending a signal does not wait for exit. Observe reparenting before this
+        # child exits, so the controller sees a forkserver that has actually died.
+        deadline = time.monotonic() + 5
+        while os.getppid() == parent:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("the forkserver did not exit")
+            time.sleep(0.001)
         os.kill(os.getpid(), signal.SIGKILL)
         return 1.0
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="as root a slot uid cannot signal the root forkserver (the attack is impossible)")
-def test_a_forkserver_dying_while_scoring_is_ours(caplog):
+@pytest.mark.parametrize("_run", range(10))
+def test_a_forkserver_dying_while_scoring_is_ours(caplog, _run):
     outcome = Episode(KillsItsForkserver).grade()
     assert outcome.status == "aborted" and outcome.reward is None
     assert "forkserver" in caplog.text
