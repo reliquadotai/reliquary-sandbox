@@ -68,6 +68,20 @@ def test_restoring_the_same_cleanup_hold_twice_counts_it_once():
     assert grader.pool.snapshot()["used_cpu_millis"] == 0
 
 
+def test_releasing_cleanup_preserves_the_miners_other_active_grading_ownership():
+    pool = GradingPool(Reservation(2_000, 4 * GIB))
+    active, cleanup = Reservation(1_100, GIB), Reservation(500, GIB)
+    assert pool.acquire(active, 0, "miner") is None
+    assert pool.acquire(cleanup, 0, "miner") is None
+    pool.disown(cleanup, "miner")
+    assert pool.snapshot()["used_cpu_millis"] == active.cpu_millis + cleanup.cpu_millis
+    pool.release(cleanup, None)
+    assert pool.snapshot()["used_cpu_millis"] == active.cpu_millis
+    assert pool.acquire(active, 0, "miner") == GRADING_POOL_OWN
+    pool.release(active, "miner")
+    assert pool.snapshot()["used_cpu_millis"] == 0
+
+
 def test_a_timeout_says_whose_gradings_held_the_pool():
     pool = GradingPool(Reservation(1_000, 4 * GIB))
     half = Reservation(500, GIB)

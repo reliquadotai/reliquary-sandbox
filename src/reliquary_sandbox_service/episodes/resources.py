@@ -188,27 +188,40 @@ class GradingPool:
             self._held[owner] = self._held.get(owner, NOTHING) + need
             return None
 
-    def release(self, need: Reservation, owner: str = "") -> None:
-        owner = str(owner)
+    def release(self, need: Reservation, owner: str | None = "") -> None:
         with self._room:
             self._used = _minus(self._used, need)
-            held = _minus(self._held.get(owner, NOTHING), need)
-            if held == NOTHING:
-                self._held.pop(owner, None)
-            else:
-                self._held[owner] = held
+            if owner is not None:
+                self._forget_owned(need, str(owner))
             self._room.notify_all()
 
-    def restore(self, need: Reservation, owner: str = "") -> None:
+    def _forget_owned(self, need: Reservation, owner: str) -> None:
+        """Forget ownership only; the caller holds `_room`."""
+        held = _minus(self._held.get(owner, NOTHING), need)
+        if held == NOTHING:
+            self._held.pop(owner, None)
+        else:
+            self._held[owner] = held
+
+    def disown(self, need: Reservation, owner: str) -> None:
+        """A failed removal is the machine's doing; retain use without blaming its miner.
+
+        Transfer attribution under the same lock as admission, without ever making
+        the still-existing box's resources available to a waiting grading.
+        """
+        with self._room:
+            self._forget_owned(need, str(owner))
+            self._room.notify_all()
+
+    def restore(self, need: Reservation) -> None:
         """Account for a persisted box left by the previous controller.
 
         It already exists, so retain its full share even if the operator reduced the
-        configured pool in the meantime. New work waits until cleanup frees it.
+        configured pool in the meantime. Its pending removal is the machine's doing,
+        with no miner ownership. New work waits until cleanup frees it.
         """
-        owner = str(owner)
         with self._room:
             self._used = self._used + need
-            self._held[owner] = self._held.get(owner, NOTHING) + need
 
     def snapshot(self) -> dict[str, int]:
         with self._room:

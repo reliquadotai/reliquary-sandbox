@@ -13,6 +13,7 @@ from reliquary_sandbox_service.episodes.grader import Grader
 from reliquary_sandbox_service.episodes.resources import (
     BOXES_PER_EPISODE,
     GRADING_POOL_FULL,
+    GRADING_POOL_OWN,
     Reservation,
     in_use,
     resources_report,
@@ -93,7 +94,8 @@ def test_a_finished_episode_frees_its_reservation(tmp_path):
 
 
 def test_failed_removal_holds_agent_and_grading_resources_until_reaped(tmp_path):
-    h = harness(tmp_path, episode_cpu_millis_total=500, episode_memory_bytes_total=3 * GIB)
+    h = harness(tmp_path, episode_cpu_millis_total=500, episode_memory_bytes_total=3 * GIB,
+                episode_grading_cpu_millis_total=500, episode_grading_memory_bytes_total=3 * GIB)
     key = open_(h, "s-1")["episode_key"]
     h.boxes.fail_remove = True
     final = h.manager.finish("s-1", key)
@@ -104,6 +106,9 @@ def test_failed_removal_holds_agent_and_grading_resources_until_reaped(tmp_path)
     assert document["resources"]["free_memory_bytes"] == 0
     assert document["grading_pool"]["used_cpu_millis"] == 500
     assert document["grading_pool"]["used_memory_bytes"] == 3 * GIB
+    owner = h.manager.store.get("s-1")["claims"]["hotkey"]
+    need = Reservation(500, 3 * GIB)
+    assert h.manager.grading_pool.acquire(need, 0, owner) == GRADING_POOL_FULL
     assert refused(h, "s-2").status_code == 503
     h.manager.reap()
     assert h.manager.grading_pool.snapshot()["used_cpu_millis"] == 500
@@ -112,6 +117,9 @@ def test_failed_removal_holds_agent_and_grading_resources_until_reaped(tmp_path)
     h.manager.reap()
     assert h.boxes.boxes == {} and h.manager.active_count() == 0
     assert h.manager.grading_pool.snapshot()["used_cpu_millis"] == 0
+    assert h.manager.grading_pool.acquire(need, 0, owner) is None
+    assert h.manager.grading_pool.acquire(need, 0, owner) == GRADING_POOL_OWN
+    h.manager.grading_pool.release(need, owner)
     open_(h, "s-3")
 
 
@@ -171,8 +179,10 @@ def test_a_grading_leftover_holds_only_the_grading_pool(tmp_path):
 
 
 @pytest.mark.parametrize("legacy", [False, True], ids=["stored-reservation", "legacy-row"])
-def test_restart_restores_failed_cleanup_holds_until_actual_removal(tmp_path, legacy):
-    h = harness(tmp_path, episode_cpu_millis_total=500, episode_memory_bytes_total=3 * GIB)
+@pytest.mark.parametrize("grading_cpu", [500, 2_000], ids=["single-box-pool", "larger-pool"])
+def test_restart_restores_failed_cleanup_holds_until_actual_removal(tmp_path, legacy, grading_cpu):
+    h = harness(tmp_path, episode_cpu_millis_total=500, episode_memory_bytes_total=3 * GIB,
+                episode_grading_cpu_millis_total=grading_cpu, episode_grading_memory_bytes_total=3 * GIB)
     key = open_(h, "s-1")["episode_key"]
     h.boxes.fail_remove = True
     h.manager.finish("s-1", key)
@@ -182,17 +192,22 @@ def test_restart_restores_failed_cleanup_holds_until_actual_removal(tmp_path, le
         h.manager.store.commit(row)
         h.settings.episode_nano_cpus = 100_000_000  # a smaller current limit cannot describe the old box
     again = restarted(h)
-    expected_cpu = 2_000 if legacy else 500
+    expected_cpu = grading_cpu if legacy else 500
     assert again.manager.grading_pool.snapshot()["used_cpu_millis"] == expected_cpu
     again.manager.reconcile()
     resources = capacity_report(again.manager)["document"]["resources"]
     assert resources["free_memory_bytes"] == 0 and resources["free_cpu_millis"] == 0
+    owner = again.manager.store.get("s-1")["claims"]["hotkey"]
+    need = Reservation(grading_cpu, 3 * GIB)
+    assert again.manager.grading_pool.acquire(need, 0, owner) == GRADING_POOL_FULL
     again.settings.episode_nano_cpus = 2_000_000_000
     assert refused(again, "s-2").status_code == 503
     again.boxes.fail_remove = False
     again.manager.reap()
     assert again.manager.grading_pool.snapshot()["used_cpu_millis"] == 0
     assert again.manager.active_count() == 0
+    assert again.manager.grading_pool.acquire(need, 0, owner) is None
+    again.manager.grading_pool.release(need, owner)
     open_(again, "s-3")
 
 

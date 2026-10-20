@@ -243,7 +243,7 @@ class Grader:
         """(env, kind) -> count of env-code failures, for the capacity/metrics report."""
         self.pool: Any = None
         """The machine's `GradingPool`, set by the manager; None: no pool."""
-        self._cleanup_holds: dict[str, tuple[Reservation, str]] = {}
+        self._cleanup_holds: dict[str, Reservation] = {}
 
     def retain_cleanup(self, box_id: str, need: Reservation, owner: str, *, restore: bool = False) -> None:
         """Keep a failed removal's pool share until that box is actually gone.
@@ -254,15 +254,17 @@ class Grader:
         with self._lock:
             if box_id not in self._cleanup_holds:
                 if restore:
-                    self.pool.restore(need, owner)
-                self._cleanup_holds[box_id] = (need, owner)
+                    self.pool.restore(need)
+                else:
+                    self.pool.disown(need, owner)
+                self._cleanup_holds[box_id] = need
 
     def release_cleanup(self, box_id: str) -> None:
         """Release a retained share once, after successful removal (including NotFound)."""
         with self._lock:
             held = self._cleanup_holds.pop(box_id, None)
         if held is not None:
-            self.pool.release(*held)
+            self.pool.release(held, None)
 
     def _note_retries(self, episode_id: str, box_id: str, *, regraded: int = 0) -> None:
         log = self.retry_log.get(episode_id)
