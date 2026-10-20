@@ -9,13 +9,15 @@ from episode_manager_fixtures import build, restarted
 from fastapi import HTTPException
 
 from reliquary_sandbox_service.episodes.capacity import capacity_report
+from reliquary_sandbox_service.episodes.grader import Grader
 from reliquary_sandbox_service.episodes.resources import (
     BOXES_PER_EPISODE,
+    GRADING_POOL_FULL,
     Reservation,
     in_use,
     resources_report,
 )
-from reliquary_sandbox_service.episodes.store import CLOSED, OPENING
+from reliquary_sandbox_service.episodes.store import CLOSED, FINISHING, OPENING
 
 GIB = 1024**3
 LIMITED = {"fake-env": "limited_episode_env:sandbox_task"}
@@ -88,6 +90,145 @@ def test_a_finished_episode_frees_its_reservation(tmp_path):
     open_(h, "s-2")
     h.manager.finish("s-1", key)
     open_(h, "s-3")
+
+
+def test_failed_removal_holds_agent_and_grading_resources_until_reaped(tmp_path):
+    h = harness(tmp_path, episode_cpu_millis_total=500, episode_memory_bytes_total=3 * GIB)
+    key = open_(h, "s-1")["episode_key"]
+    h.boxes.fail_remove = True
+    final = h.manager.finish("s-1", key)
+    assert final["record"]["body"]["status"] == "graded"
+    document = capacity_report(h.manager)["document"]
+    assert document["resources"]["sessions"] == ["s-1"]
+    assert document["resources"]["free_cpu_millis"] == 0
+    assert document["resources"]["free_memory_bytes"] == 0
+    assert document["grading_pool"]["used_cpu_millis"] == 500
+    assert document["grading_pool"]["used_memory_bytes"] == 3 * GIB
+    assert refused(h, "s-2").status_code == 503
+    h.manager.reap()
+    assert h.manager.grading_pool.snapshot()["used_cpu_millis"] == 500
+    h.boxes.fail_remove = False
+    h.manager.reap()
+    h.manager.reap()
+    assert h.boxes.boxes == {} and h.manager.active_count() == 0
+    assert h.manager.grading_pool.snapshot()["used_cpu_millis"] == 0
+    open_(h, "s-3")
+
+
+def test_failed_removal_keeps_a_slot_on_machines_without_resource_totals(tmp_path):
+    h = build(tmp_path, episode_envs=LIMITED, episode_capacity=1)
+    key = open_(h, "s-1")["episode_key"]
+    h.boxes.fail_remove = True
+    h.manager.finish("s-1", key)
+    assert capacity_report(h.manager)["document"]["free"] == 0
+    assert refused(h, "s-2").detail == "no free episode slot"
+    h.boxes.fail_remove = False
+    h.manager.reap()
+    assert capacity_report(h.manager)["document"]["free"] == 1
+    open_(h, "s-3")
+
+
+def test_a_grading_leftover_keeps_a_slot_without_a_grading_pool(tmp_path):
+    h = build(tmp_path, episode_envs=LIMITED, episode_capacity=1)
+    key = open_(h, "s-1")["episode_key"]
+    remove = h.boxes.remove
+
+    def remove_agent_only(box_id):
+        if box_id != "s-1":
+            raise OSError("removal is busy")
+        remove(box_id)
+
+    h.boxes.remove = remove_agent_only
+    h.manager.finish("s-1", key)
+    assert "s-1" not in h.boxes.boxes
+    assert capacity_report(h.manager)["document"]["free"] == 0
+    assert refused(h, "s-2").detail == "no free episode slot"
+    h.boxes.remove = remove
+    h.manager.reap()
+    open_(h, "s-3")
+
+
+def test_a_grading_leftover_holds_only_the_grading_pool(tmp_path):
+    h = harness(tmp_path, episode_grading_cpu_millis_total=500,
+                episode_grading_memory_bytes_total=3 * GIB)
+    key = open_(h, "s-1")["episode_key"]
+    remove = h.boxes.remove
+
+    def remove_agent_only(box_id):
+        if box_id != "s-1":
+            raise OSError("removal is busy")
+        remove(box_id)
+
+    h.boxes.remove = remove_agent_only
+    h.manager.finish("s-1", key)
+    document = capacity_report(h.manager)["document"]
+    assert document["active"] == 0 and document["resources"]["sessions"] == []
+    assert document["resources"]["free_cpu_millis"] == document["resources"]["cpu_millis"]
+    assert h.manager.grading_pool.acquire(Reservation(500, 3 * GIB), 0) == GRADING_POOL_FULL
+    h.boxes.remove = remove
+    h.manager.reap()
+    assert h.manager.grading_pool.snapshot()["used_cpu_millis"] == 0
+
+
+@pytest.mark.parametrize("legacy", [False, True], ids=["stored-reservation", "legacy-row"])
+def test_restart_restores_failed_cleanup_holds_until_actual_removal(tmp_path, legacy):
+    h = harness(tmp_path, episode_cpu_millis_total=500, episode_memory_bytes_total=3 * GIB)
+    key = open_(h, "s-1")["episode_key"]
+    h.boxes.fail_remove = True
+    h.manager.finish("s-1", key)
+    if legacy:
+        row = h.manager.store.get("s-1")
+        row.pop("reserve")
+        h.manager.store.commit(row)
+        h.settings.episode_nano_cpus = 100_000_000  # a smaller current limit cannot describe the old box
+    again = restarted(h)
+    expected_cpu = 2_000 if legacy else 500
+    assert again.manager.grading_pool.snapshot()["used_cpu_millis"] == expected_cpu
+    again.manager.reconcile()
+    resources = capacity_report(again.manager)["document"]["resources"]
+    assert resources["free_memory_bytes"] == 0 and resources["free_cpu_millis"] == 0
+    again.settings.episode_nano_cpus = 2_000_000_000
+    assert refused(again, "s-2").status_code == 503
+    again.boxes.fail_remove = False
+    again.manager.reap()
+    assert again.manager.grading_pool.snapshot()["used_cpu_millis"] == 0
+    assert again.manager.active_count() == 0
+    open_(again, "s-3")
+
+
+def test_restart_recovers_a_grading_box_before_its_cleanup_was_saved(tmp_path):
+    h = harness(tmp_path, episode_cpu_millis_total=500, episode_memory_bytes_total=3 * GIB,
+                episode_grading_cpu_millis_total=500, episode_grading_memory_bytes_total=3 * GIB)
+    open_(h, "s-1")
+    episode = h.manager.store.get("s-1")
+    episode["status"] = FINISHING
+    h.manager.store.commit(episode)
+    grading_box = Grader.pristine_box_id("s-1", 0)
+    h.boxes.create(grading_box, "s-1", None)
+    h.boxes.fail_remove = True
+    again = restarted(h)
+    again.manager.reconcile()
+    assert set(again.manager.store.get("s-1")["cleanup"]) == {"s-1", grading_box}
+    document = capacity_report(again.manager)["document"]
+    assert document["resources"]["free_memory_bytes"] == 0
+    assert document["grading_pool"]["used_cpu_millis"] == 500
+    assert document["grading_pool"]["used_memory_bytes"] == 3 * GIB
+    assert refused(again, "s-2").status_code == 503
+    again.boxes.fail_remove = False
+    again.manager.reap()
+    assert again.manager.grading_pool.snapshot()["used_cpu_millis"] == 0
+    open_(again, "s-3")
+
+
+def test_startup_refuses_untracked_orphans_that_cannot_be_removed(tmp_path):
+    h = harness(tmp_path)
+    h.boxes.create("stray", "unknown-episode", None)
+    h.boxes.fail_remove = True
+    with pytest.raises(RuntimeError, match="orphaned box cleanup incomplete"):
+        h.manager.reconcile()
+    h.boxes.fail_remove = False
+    h.manager.reconcile()
+    assert h.boxes.boxes == {}
 
 
 def _abort(h, key):                 # the box vanished under us: the call aborts the episode

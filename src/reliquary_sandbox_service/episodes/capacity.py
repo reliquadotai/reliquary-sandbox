@@ -82,7 +82,7 @@ def capacity_report(manager: Any) -> dict[str, Any]:
             "max_transcript_bytes": settings.episode_max_transcript_bytes,
         },
     }
-    resources = resources_report(settings, manager.store.active())
+    resources = resources_report(settings, manager.store.reserving())
     if resources is not None:   # absent when nothing is accounted: older reports keep their bytes
         document["resources"] = resources
     pool = getattr(manager, "grading_pool", None)

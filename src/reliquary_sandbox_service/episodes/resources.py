@@ -1,13 +1,14 @@
 """CPU and memory a machine's episodes reserve (capacity in CPU and memory units).
 
-An episode reserves, from the moment its open is accepted until its row closes, its agent box: the box's
+An episode reserves, from the moment its open is accepted until its agent box is removed, that box: the box's
 CPUs as the machine sizes it (`TaskLimits.cpus`, never above `episode_nano_cpus` on an accounting
 machine: a bigger task is refused) and the token's memory budget. The grading box does not draw from
 these totals: it runs in the machine's grading pool (`GradingPool`). The reservable CPU is
 `episode_cpu_millis_total` x `episode_cpu_overcommit` (the agent box idles while the miner runs its
 model; the factor is fixed at qualification); memory is never overcommitted. An open whose reservation
 does not fit what is left is refused 503 (retried); one that could never fit is refused 422. With both
-totals unset nothing is accounted (slots only, and today's CPU clamp)."""
+totals unset nothing is accounted (slots only, and today's CPU clamp). A failed removal retains the
+box's reservation even after the episode closes; the reaper releases it only after cleanup succeeds."""
 
 from __future__ import annotations
 
@@ -81,10 +82,27 @@ def row_reservation(episode: Mapping[str, Any], settings: Any) -> Reservation:
     return episode_reservation(settings.episode_nano_cpus, memory)
 
 
+def cleanup_reservation(episode: Mapping[str, Any], settings: Any,
+                        budget: Reservation) -> Reservation:
+    """An existing box's share, reserving the whole CPU budget for legacy rows.
+
+    Without a stored reservation its historical CPU limit is unknown; the current
+    box maximum may have been lowered. Admit no extra CPU work until it is removed.
+    The token still states its exact memory limit.
+    """
+    need = row_reservation(episode, settings)
+    if Reservation.from_dict(episode.get("reserve")) is None:
+        need = Reservation(max(need.cpu_millis, budget.cpu_millis), need.memory_bytes)
+    return need
+
+
 def in_use(rows: Iterable[Mapping[str, Any]], settings: Any) -> Reservation:
     used = NOTHING
     for row in rows:
-        used = used + row_reservation(row, settings)
+        need = (cleanup_reservation(row, settings, totals(settings))
+                if row.get("status") == "CLOSED" and resources_enabled(settings)
+                else row_reservation(row, settings))
+        used = used + need
     return used
 
 
@@ -180,6 +198,17 @@ class GradingPool:
             else:
                 self._held[owner] = held
             self._room.notify_all()
+
+    def restore(self, need: Reservation, owner: str = "") -> None:
+        """Account for a persisted box left by the previous controller.
+
+        It already exists, so retain its full share even if the operator reduced the
+        configured pool in the meantime. New work waits until cleanup frees it.
+        """
+        owner = str(owner)
+        with self._room:
+            self._used = self._used + need
+            self._held[owner] = self._held.get(owner, NOTHING) + need
 
     def snapshot(self) -> dict[str, int]:
         with self._room:

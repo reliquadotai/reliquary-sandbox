@@ -94,7 +94,7 @@ from .local_runtime import (
     StepTimeout,
     UnsupportedRuntimeMember,
 )
-from .resources import grading_reservation
+from .resources import Reservation, grading_reservation
 
 _log = logging.getLogger(__name__)
 
@@ -243,6 +243,26 @@ class Grader:
         """(env, kind) -> count of env-code failures, for the capacity/metrics report."""
         self.pool: Any = None
         """The machine's `GradingPool`, set by the manager; None: no pool."""
+        self._cleanup_holds: dict[str, tuple[Reservation, str]] = {}
+
+    def retain_cleanup(self, box_id: str, need: Reservation, owner: str, *, restore: bool = False) -> None:
+        """Keep a failed removal's pool share until that box is actually gone.
+        `restore` rebuilds a persisted hold at startup; repeated restores are harmless.
+        """
+        if self.pool is None:
+            return
+        with self._lock:
+            if box_id not in self._cleanup_holds:
+                if restore:
+                    self.pool.restore(need, owner)
+                self._cleanup_holds[box_id] = (need, owner)
+
+    def release_cleanup(self, box_id: str) -> None:
+        """Release a retained share once, after successful removal (including NotFound)."""
+        with self._lock:
+            held = self._cleanup_holds.pop(box_id, None)
+        if held is not None:
+            self.pool.release(*held)
 
     def _note_retries(self, episode_id: str, box_id: str, *, regraded: int = 0) -> None:
         log = self.retry_log.get(episode_id)
@@ -427,7 +447,10 @@ class Grader:
                     cleanup.append(box_id)
                     removed = False
                 if self.pool is not None:
-                    self.pool.release(need, owner)
+                    if removed:
+                        self.pool.release(need, owner)
+                    else:
+                        self.retain_cleanup(box_id, need, owner)
             if isinstance(outcome, GradeOutcome):
                 return dataclasses.replace(outcome, cleanup=tuple(cleanup))
             if isinstance(outcome, _StartFailed):
@@ -439,7 +462,7 @@ class Grader:
                 reason = outcome
             if not removed:
                 # A grading box that could not be removed may still run: no retry beside it (its
-                # pool share is released; the machine's cleanup removes the box).
+                # pool share stays held until the machine's cleanup removes the box).
                 reason = f"{reason}; a grading box could not be removed"
                 break
         if kept is not None:
