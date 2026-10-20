@@ -220,8 +220,8 @@ runner that finished; the controller requires it and its status."""
 #   so a flood is capped inside the box while the command still runs to the end
 #   and the controller can tell exactly whether it was truncated. The runner
 #   holds the output FIFOs open (O_RDWR) until the command is gone, so the
-#   command never blocks on open. A final open/close of the intermediate FIFOs
-#   guarantees `head` sees EOF even if its `cat` was killed before it opened.
+#   command never blocks on open. Intermediate FIFO readers are opened before
+#   cappers start, so even a late capper can drain and see EOF after relay exit.
 # * Once the command is reaped the cappers get ~1.5 s to drain, then their
 #   FIFO readers (`cat`, not the agent's processes) are killed so `head` sees
 #   EOF and flushes what it holds: a background service or a setsid escapee
@@ -241,30 +241,32 @@ if [ -e "$d/$id.killed" ]; then cleanup; printf 'RQ-END %s %s' "$id" 137; exit 1
 $B mkfifo "$d/$id.out" "$d/$id.err" "$d/$id.o2" "$d/$id.e2" || refuse
 ( exec 4<>"$d/$id.out" 5<>"$d/$id.err" ) || refuse
 exec 4<>"$d/$id.out" 5<>"$d/$id.err"
-$B cat <"$d/$id.out" >"$d/$id.o2" 4>&- 5>&- &
+exec 6<>"$d/$id.o2" 7<>"$d/$id.e2"
+exec 8<"$d/$id.o2" 9<"$d/$id.e2"
+$B cat <"$d/$id.out" >"$d/$id.o2" 4>&- 5>&- 6>&- 7>&- 8>&- 9>&- &
 r1=$!
-{ $B head -c "$n"; $B cat >/dev/null; : > "$d/$id.d1"; } <"$d/$id.o2" 4>&- 5>&- &
+{ $B head -c "$n"; $B cat >/dev/null; : > "$d/$id.d1"; } <&8 4>&- 5>&- 6>&- 7>&- 8>&- 9>&- &
 c1=$!
-$B cat <"$d/$id.err" >"$d/$id.e2" 4>&- 5>&- &
+$B cat <"$d/$id.err" >"$d/$id.e2" 4>&- 5>&- 6>&- 7>&- 8>&- 9>&- &
 r2=$!
-{ $B head -c "$n"; $B cat >/dev/null; : > "$d/$id.d2"; } <"$d/$id.e2" >&3 4>&- 5>&- &
+{ $B head -c "$n"; $B cat >/dev/null; : > "$d/$id.d2"; } <&9 >&3 4>&- 5>&- 6>&- 7>&- 8>&- 9>&- &
 c2=$!
+exec 8<&- 9<&-
 (
   cd -- "$4" 2>/dev/null || { echo "bash: cd: $4: No such file or directory" >&2; exit 1; }
   exec $B setsid /bin/bash -c "$3"
-) </dev/null >"$d/$id.out" 2>"$d/$id.err" 3>&- 4>&- 5>&- &
+) </dev/null >"$d/$id.out" 2>"$d/$id.err" 3>&- 4>&- 5>&- 6>&- 7>&- &
 child=$!
 printf '%s' "$child" > "$pg" || { $B kill -s KILL -- "-$child"; wait "$child"; refuse; }
 [ -e "$d/$id.killed" ] && $B kill -s KILL -- "-$child"
 wait "$child"
 status=$?
-exec 4>&- 5>&-
+exec 4>&- 5>&- 6>&- 7>&-
 i=0
 while [ "$i" -lt 15 ] && { [ ! -e "$d/$id.d1" ] || [ ! -e "$d/$id.d2" ]; }; do
   $B sleep 0.1; i=$((i+1))
 done
 $B kill -s KILL "$r1" "$r2" 2>/dev/null
-( exec 8<>"$d/$id.o2" 9<>"$d/$id.e2" )
 wait "$c1" "$c2"
 cleanup
 printf 'RQ-END %s %s' "$id" "$status"
