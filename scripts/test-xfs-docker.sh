@@ -38,32 +38,62 @@ BRIDGE=rqxfs0
 BRIDGE_ADDRESS=10.231.0.1/24
 BRIDGE_MARKER=/run/reliquary-xfs-docker.bridge-created  # up created $BRIDGE: down may delete it
 
+# The start time of our daemon, optionally matching a previously observed one.
+# Keep checking the process after dockerd removes its pidfile during shutdown.
+daemon_identity() {
+  local pid=$1 stat started cmdline
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  cmdline=$(tr '\0' ' ' 2>/dev/null < "/proc/$pid/cmdline") || return 1
+  grep -qF -- "--config-file $ROOT/daemon.json " <<< "$cmdline" || return 1
+  stat=$(cat "/proc/$pid/stat" 2>/dev/null) || return 1
+  # Fields after the final ')' start at field 3; starttime is field 22.
+  started=$(awk '{print $20}' <<< "${stat##*) }")
+  case "$started" in ''|*[!0-9]*) return 1 ;; esac
+  [ -z "${2:-}" ] || [ "$started" = "$2" ] || return 1
+  echo "$started"
+}
+
 # The pid of OUR daemon, or nothing: the pidfile alone is not trusted.
 ours() {
-  [ -f "$PIDFILE" ] || return 1
   local pid
-  pid=$(cat "$PIDFILE")
-  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
-  [ -r "/proc/$pid/cmdline" ] || return 1
-  tr '\0' ' ' < "/proc/$pid/cmdline" | grep -qF -- "--config-file $ROOT/daemon.json " || return 1
+  pid=$(cat "$PIDFILE" 2>/dev/null) || return 1
+  daemon_identity "$pid" >/dev/null || return 1
   echo "$pid"
 }
 
 # Non-veth links as "name mac", sorted (states churn with the main daemon's containers).
 links() { ip -br link | awk '$1 !~ /^veth/ { sub(/@.*/, "", $1); print $1, $3 }' | sort; }
 
+# Mount release can lag behind process exit. Retry normal unmounts, and keep
+# cleanup fatal if the owned mount is still busy after the bounded wait.
+unmount_owned() {
+  local target=$1
+  for _ in $(seq 60); do
+    mountpoint -q "$target" || return 0
+    umount "$target" && return 0
+    sleep 1
+  done
+  mountpoint -q "$target" || return 0
+  echo "could not unmount $target" >&2
+  return 1
+}
+
 down() {
-  local pid
-  if pid=$(ours); then
-    kill "$pid"
-    for _ in $(seq 60); do ours >/dev/null || break; sleep 1; done
-    if ours >/dev/null; then echo "the daemon did not stop" >&2; exit 1; fi
+  local pid identity
+  if pid=$(ours) && identity=$(daemon_identity "$pid"); then
+    if daemon_identity "$pid" "$identity" >/dev/null; then
+      if ! kill "$pid"; then
+        if daemon_identity "$pid" "$identity" >/dev/null; then return 1; fi
+      fi
+    fi
+    for _ in $(seq 60); do daemon_identity "$pid" "$identity" >/dev/null || break; sleep 1; done
+    if daemon_identity "$pid" "$identity" >/dev/null; then echo "the daemon did not stop" >&2; return 1; fi
   fi
   # What the daemon left mounted under its own exec-root (its null netns).
   { findmnt -rn -o TARGET | grep "^$EXEC_ROOT/" || true; } | sort -r | while read -r target; do
-    umount "$target"
-  done
-  if mountpoint -q "$ROOT/mnt"; then umount "$ROOT/mnt"; fi
+    unmount_owned "$target" || return 1
+  done || return 1
+  unmount_owned "$ROOT/mnt" || return 1
   if [ -f "$BRIDGE_MARKER" ]; then
     if ip -d link show "$BRIDGE" >/dev/null 2>&1; then ip link del "$BRIDGE"; fi
     rm -f "$BRIDGE_MARKER"
