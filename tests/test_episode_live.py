@@ -217,11 +217,15 @@ def test_cpu_is_measured_per_call(boxes, image):
     box_id = start(boxes, image)
     readings = [boxes.cpu_ns(box_id)]
     began = time.monotonic()
-    bash(boxes, box_id, "i=0; while [ $i -lt 400000 ]; do i=$((i+1)); done", timeout_s=60)
+    active = bash(boxes, box_id, "i=0; while [ $i -lt 1200000 ]; do i=$((i+1)); done",
+                  timeout_s=60)
     wall = time.monotonic() - began
+    assert active.exit_code == 0 and not active.timed_out, active
     readings.append(boxes.cpu_ns(box_id))
     busy = readings[-1] - readings[-2]
-    bash(boxes, box_id, "sleep 1")
+    # Match wall durations so billing wall time still fails the CPU ratio check.
+    idle_call = bash(boxes, box_id, f"sleep {wall:.6f}", timeout_s=60)
+    assert idle_call.exit_code == 0 and not idle_call.timed_out, idle_call
     readings.append(boxes.cpu_ns(box_id))
     idle = readings[-1] - readings[-2]
     for _ in range(3):
