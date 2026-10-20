@@ -18,6 +18,7 @@ from collections.abc import Callable, Sequence
 from functools import wraps
 from typing import Any
 
+from . import mini
 from .spec import BASH_VF_B2E4E81, HarnessSpec, decorate_observation
 from .variant import variant as variant_of
 
@@ -87,6 +88,7 @@ class QwenTurnRenderer:
         self._canonical = {surface[name]: name for name in offered}
         self._hidden = frozenset(name for name in surface if surface[name] != name)
         self.observation_format = spec.observation_format(values)
+        self._text = spec.text_actions
         self._r = renderer
         # P6: HF tokenizers are not thread-safe; intake, grading and export share this.
         self._lock = threading.RLock()
@@ -120,14 +122,20 @@ class QwenTurnRenderer:
         return [dict(tool) for tool in self._tools]
 
     @property
+    def _shown_tools(self):
+        """The tools the template renders (None when the model is shown none: text actions)."""
+        return self._tools or None
+
+    @property
     def system_prompt(self) -> str:
         return self._system_prompt
 
     @_locked
     def initial_ids(self, prompt: str) -> list[int]:
         rendered = self._r.render(
-            [{"role": "system", "content": self._system_prompt}, {"role": "user", "content": prompt}],
-            tools=self._tools, add_generation_prompt=True)
+            [{"role": "system", "content": self._system_prompt},
+             {"role": "user", "content": self.spec.user_prompt(prompt)}],
+            tools=self._shown_tools, add_generation_prompt=True)
         return [int(t) for t in rendered.token_ids]
 
     def canonical_name(self, name: str) -> str:
@@ -138,11 +146,28 @@ class QwenTurnRenderer:
         return HIDDEN_PREFIX + name if name in self._hidden else name
 
     def _surface_calls(self, completion_ids) -> list[tuple[str, str]]:
+        if self._text:
+            ended = bool(completion_ids) and int(completion_ids[-1]) in self.stop_ids
+            return mini.turn_calls(self._parse(completion_ids).content or "", ended=ended)
+        return self._template_calls(completion_ids)
+
+    def _template_calls(self, completion_ids) -> list[tuple[str, str]]:
         return pinned_tool_calls(self._parse(completion_ids).tool_calls, self._unknown)
 
     @_locked
     def tool_calls(self, completion_ids) -> list[tuple[str, str]]:
         return [(self.canonical_name(name), arguments) for name, arguments in self._surface_calls(completion_ids)]
+
+    def turn_calls(self, result) -> list[tuple[str, str, str]]:
+        """`(id, canonical name, arguments)` of a generate result (`renderers.client.generate`'s dict)."""
+        if self._text:
+            return [(f"call_{i}", name, arguments)
+                    for i, (name, arguments) in enumerate(self.tool_calls(result["completion_ids"]))]
+        return self.calls_of(result.get("tool_calls"))
+
+    def refusal_observation(self, name: str, arguments: str | None) -> str | None:
+        """The harness's own text for a call answered locally (mini's format errors), or None."""
+        return mini.refusal(name, arguments) if self._text else None
 
     def calls_of(self, parsed_calls) -> list[tuple[str, str, str]]:
         """`calls_with_ids` of a parse result's calls (the generate endpoint's), canonical names."""
@@ -158,7 +183,7 @@ class QwenTurnRenderer:
         """The pinned parser, made total: whatever it raises on a span refuses it
         (`refuse`) instead of escaping the caller."""
         try:
-            return self._r.parse_response(list(completion_ids), tools=self._tools)
+            return self._r.parse_response(list(completion_ids), tools=self._shown_tools)
         except Exception as exc:  # RecursionError is an Exception
             raise self._refuse(exc) from None
 
@@ -178,16 +203,18 @@ class QwenTurnRenderer:
                 start = None
         return out
 
-    @staticmethod
-    def tool_messages(observations: Sequence[str]) -> list[dict[str, Any]]:
-        """The tool messages a turn's observations are bridged as (spec `observation.tool_message`)."""
+    def tool_messages(self, observations: Sequence[str]) -> list[dict[str, Any]]:
+        """The messages a turn's observations are bridged as: tool messages (spec
+        `observation.tool_message`), or, with text actions, user messages."""
+        if self._text:
+            return [{"role": "user", "content": text} for text in observations]
         return [{"role": "tool", "tool_call_id": f"call_{i}", "content": text}
                 for i, text in enumerate(observations)]
 
     @_locked
     def next_prompt(self, prompt_ids, completion_ids, observations) -> list[int] | None:
         rendered = self._r.bridge_to_next_turn(list(prompt_ids), list(completion_ids),
-                                               self.tool_messages(observations), tools=self._tools)
+                                               self.tool_messages(observations), tools=self._shown_tools)
         return None if rendered is None else [int(t) for t in rendered.token_ids]
 
     def _tail(self, ids) -> list[int]:
@@ -227,7 +254,7 @@ class QwenTurnRenderer:
             texts += [call["function"]["name"], call["function"]["arguments"]]
         if any(literal in text for text in texts for literal in self._literals):
             return False
-        rendered = self._r.render([{"role": "user", "content": "x"}, message], tools=self._tools,
+        rendered = self._r.render([{"role": "user", "content": "x"}, message], tools=self._shown_tools,
                                   add_generation_prompt=False).token_ids
         tail = self._tail([int(t) for t in rendered])
         closes = [k for k, t in enumerate(tail) if t == self.terminator_id]
@@ -251,7 +278,7 @@ class QwenTurnRenderer:
     def render_messages(self, messages) -> list[int]:
         """A whole conversation (system, user, assistant and tool messages), as
         the pinned template renders it with the harness tools."""
-        rendered = self._r.render(list(messages), tools=self._tools, add_generation_prompt=False)
+        rendered = self._r.render(list(messages), tools=self._shown_tools, add_generation_prompt=False)
         return [int(t) for t in rendered.token_ids]
 
     @_locked
@@ -266,7 +293,7 @@ class QwenTurnRenderer:
         message = {"role": "assistant", "content": parsed.content or ""}
         if parsed.reasoning_content:
             message["reasoning_content"] = parsed.reasoning_content
-        calls = self._surface_calls(completion_ids)
+        calls = [] if self._text else self._template_calls(completion_ids)
         if calls:
             message["tool_calls"] = [{"id": f"call_{i}", "type": "function",
                                       "function": {"name": name, "arguments": arguments}}

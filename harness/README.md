@@ -11,6 +11,9 @@ later, the sandbox gateway (observations). Nothing here runs a tool or loads a m
   variant 0 is the compatibility surface): the model sees the variant's names, the calls
   read back carry the canonical names the gateway runs.
 * `qwen.py`: `QwenTurnRenderer`, render and parse in the pinned Qwen3.8 template.
+* `mini.py`: mini-swe-agent's text-based harness (`MINI_SWE_V1`, `mini-swe@1`): one fenced
+  bash block per turn, mini's observation and format-error texts (MIT, see
+  `MINI_SWE_AGENT_LICENSE.md`), the submit command ending the episode.
 * `engine.py`: one model turn on a vLLM `/inference/v1/generate` endpoint, as verifiers'
   train client sends it.
 * `loop.py`: the episode loop and its stops.

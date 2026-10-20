@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-IMPLEMENTATION_FILES = ("spec.py", "qwen.py", "loop.py", "engine.py", "variant.py")
+IMPLEMENTATION_FILES = ("spec.py", "qwen.py", "loop.py", "engine.py", "variant.py", "mini.py")
 """The package modules whose source the digest covers: they decide every token."""
 
 
@@ -66,6 +66,9 @@ class HarnessSpec:
     think: Mapping[str, Any]
     variants: Mapping[str, Any] = field(default_factory=lambda: {"axes": []})
     upstream: Mapping[str, Any] = field(default_factory=dict)
+    actions: Mapping[str, Any] = field(default_factory=lambda: {"mode": "tool-calls"})
+    """How a turn names its action: `tool-calls` (the template's function calls) or `text`
+    (mini-swe-agent: one fenced bash block in the answer; no tool is shown to the model)."""
 
     @property
     def key(self) -> str:
@@ -77,7 +80,7 @@ class HarnessSpec:
                 "system_prompt": dict(self.system_prompt), "network_notice": dict(self.network_notice),
                 "parse": dict(self.parse), "observation": dict(self.observation),
                 "stops": dict(self.stops), "think": dict(self.think), "variants": dict(self.variants),
-                "upstream": dict(self.upstream)}
+                "upstream": dict(self.upstream), "actions": dict(self.actions)}
 
     def spec_sha256(self) -> str:
         return hashlib.sha256(canonical_json(self.to_dict())).hexdigest()
@@ -96,6 +99,15 @@ class HarnessSpec:
             raise ValueError(f"the {self.family} harness offers {offered}, not {list(names)}")
         return names
 
+    @property
+    def text_actions(self) -> bool:
+        return self.actions.get("mode") == "text"
+
+    def user_prompt(self, task: str) -> str:
+        """The first user message: the task, inside the spec's instance template when it has one."""
+        instance = self.system_prompt.get("instance")
+        return task if instance is None else instance.replace("{task}", task)
+
     def surface_names(self, values: Mapping[str, Any] | None = None) -> dict[str, str]:
         """{canonical tool name: the name the model is shown} under a variant's axis values
         (`variant.variant(spec, index).values`; None or no `tools` axis: the canonical names)."""
@@ -109,6 +121,8 @@ class HarnessSpec:
         since parameter coercion follows their schemas. A variant's `tools` axis renames a
         tool and rewords its description; its parameters stay the canonical ones."""
         names = self.tool_set(tools)
+        if self.text_actions:
+            return ()
         surface = (values or {}).get("tools") or {}
         shown = []
         for tool in self.tools:
@@ -126,6 +140,8 @@ class HarnessSpec:
         """The enabled fragments joined; a variant's `system_prompt` axis is a fragment per
         tool, with `{bash}`/`{edit}` standing for the tools' surface names."""
         names = self.tool_set(tools)
+        if "text" in self.system_prompt:
+            return self.system_prompt["text"]
         phrased = (values or {}).get("system_prompt")
         fragments = phrased if phrased is not None else self.system_prompt["fragments"]
         surface = self.surface_names(values)
@@ -137,7 +153,7 @@ class HarnessSpec:
     def observation_format(self, values: Mapping[str, Any] | None = None) -> str:
         """How a signed call record is shown: `plain` (the gateway's rendering as is) or a
         variant's `observation` axis value (`decorate_observation`)."""
-        return (values or {}).get("observation", "plain")
+        return (values or {}).get("observation", self.observation.get("shown", "plain"))
 
     def with_network_notice(self, content: str) -> str:
         notice = self.network_notice["text"]
@@ -227,7 +243,7 @@ BASH_VF_B2E4E81 = HarnessSpec(
               }},
 )
 
-OBSERVATION_FORMATS = ("plain", "exit-code")
+OBSERVATION_FORMATS = ("plain", "exit-code", "mini")
 
 
 def decorate_observation(fmt: str, body: Mapping[str, Any], text: str) -> str:
@@ -242,6 +258,10 @@ def decorate_observation(fmt: str, body: Mapping[str, Any], text: str) -> str:
         if type(code) is not int:
             raise ValueError("a call record's exit_code must be an integer")
         return f"[exit code: {code}]\n{text}"
+    if fmt == "mini":
+        from .mini import observation
+
+        return observation(body)
     raise ValueError(f"unknown observation format {fmt!r}")
 
 
@@ -269,7 +289,32 @@ BASH_SURFACE_V1 = dataclasses.replace(
     variants={"axes": [SURFACE_TOOLS, SURFACE_PROMPTS]},
 )
 
-SPECS: dict[str, HarnessSpec] = {spec.key: spec for spec in (BASH_VF_B2E4E81, BASH_SURFACE_V1)}
+
+def _mini_swe_v1() -> HarnessSpec:
+    from . import mini
+
+    return dataclasses.replace(
+        BASH_VF_B2E4E81,
+        id="mini-swe",
+        version="1",
+        family="mini-swe-agent",
+        # bash is what runs (edit, when the env offers it, is never called); the model is shown no tool.
+        system_prompt={"text": mini.SYSTEM, "instance": mini.INSTANCE},
+        parse={"filter": "one-fenced-block", "regex": mini.ACTION_REGEX, "submit": mini.SUBMIT,
+               "errors": {"format": mini.FORMAT_ERROR_CALL, "length": mini.LENGTH_ERROR_CALL}},
+        observation={"format": "reliquary-observation/1", "tools_versions": ["reliquary-tools/1"], "shown": "mini",
+                     "message": {"role": "user"}},
+        stops={"before_model_call": ["max_turns", "episode_closed"], "after_turn": {"submit": "agent_completed"},
+               "overlong_prompt": "context_length", "closed_on_a_call": "episode_closed", "max_tokens_per_turn": "job"},
+        actions={"mode": "text"},
+        upstream={"mini-swe-agent": "04d809ceab9df28f9adaed044884180159172930",
+                  "files": ["src/minisweagent/config/mini_textbased.yaml", "src/minisweagent/models/utils/actions_text.py"]},
+    )
+
+
+MINI_SWE_V1 = _mini_swe_v1()
+
+SPECS: dict[str, HarnessSpec] = {spec.key: spec for spec in (BASH_VF_B2E4E81, BASH_SURFACE_V1, MINI_SWE_V1)}
 
 
 def get_spec(harness_id: str, version: str) -> HarnessSpec:
@@ -292,7 +337,7 @@ def digest_refusal(harness_id: str, version: str, digest: str) -> str | None:
     return None
 
 
-__all__ = ["BASH_SENTENCE", "BASH_SURFACE_V1", "BASH_TOOL", "BASH_VF_B2E4E81", "OBSERVATION_FORMATS",
+__all__ = ["BASH_SENTENCE", "BASH_SURFACE_V1", "MINI_SWE_V1", "BASH_TOOL", "BASH_VF_B2E4E81", "OBSERVATION_FORMATS",
            "decorate_observation", "CAPABILITY_NOTICE", "EDIT_SENTENCE", "EDIT_TOOL",
            "HarnessSpec", "SPECS", "VERIFIERS_COMMIT", "canonical_json", "digest_refusal", "get_spec",
            "harness_digest", "implementation_sha256"]

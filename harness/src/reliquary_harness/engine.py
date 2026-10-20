@@ -74,13 +74,13 @@ class GenerateEngine:
         try:
             result = await generate(client=self._client, renderer=self._renderer.renderer, messages=[],
                                     model=self.model, prompt_ids=list(prompt_ids),
-                                    tools=self._renderer.tools, sampling_params=sampling,
+                                    tools=self._renderer.tools or None, sampling_params=sampling,
                                     extra_headers={SESSION_ID_HEADER: session_id})
         except OverlongPromptError as exc:
             raise OverlongPrompt(str(exc)) from exc
         return Turn(tuple(int(t) for t in result["prompt_ids"]),
                     tuple(int(t) for t in result["completion_ids"]),
-                    tuple(self._renderer.calls_of(result.get("tool_calls"))),
+                    tuple(self._renderer.turn_calls(result)),
                     result.get("finish_reason"))
 
     async def aclose(self) -> None:
