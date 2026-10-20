@@ -57,11 +57,14 @@ class VerifiersEnvRef:
 
 
 def _split_token(value: Any, what: str) -> str:
-    """A split name or value: lower-case `[a-z0-9_]+`, never normalised, never containing eval."""
-    if (not isinstance(value, str) or SPLIT_NAME.fullmatch(value) is None
-            or EVAL_SPLIT in value.lower()):
-        raise ValueError(f"invalid {what} {value!r}: lower-case [a-z0-9_]+, and eval is never served")
+    """A split name or value: lower-case `[a-z0-9_]+`, never normalised."""
+    if not isinstance(value, str) or SPLIT_NAME.fullmatch(value) is None:
+        raise ValueError(f"invalid {what} {value!r}: lower-case [a-z0-9_]+")
     return value
+
+
+def _says_eval(token: str) -> bool:
+    return EVAL_SPLIT in token
 
 
 def _frozen_splits(raw: Any) -> Mapping[str, Mapping[str, Any]]:
@@ -74,7 +77,11 @@ def _frozen_splits(raw: Any) -> Mapping[str, Mapping[str, Any]]:
             raise ValueError(f"split {name!r} must map to taskset config overrides")
         if set(overrides) != {"split"}:
             raise ValueError(f"split {name!r}: overrides must be exactly {{'split': ...}}")
-        splits[name] = MappingProxyType({"split": _split_token(overrides["split"], "split value")})
+        value = _split_token(overrides["split"], "split value")
+        if _says_eval(name) != _says_eval(value):
+            raise ValueError(f"split {name!r} serves {value!r}: a split serving eval tasks is "
+                             "named eval, and only such a split is")
+        splits[name] = MappingProxyType({"split": value})
     return MappingProxyType(splits)
 
 
