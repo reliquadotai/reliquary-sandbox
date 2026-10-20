@@ -30,6 +30,7 @@ ours() {{ echo 4242; }}
 daemon_identity() {{ return 1; }}
 sleep() {{ local ticks; ticks=$(cat "$STATE/ticks"); echo $((ticks + 1)) > "$STATE/ticks"; }}
 kill() {{ echo "kill $*" >> "$STATE/events"; }}
+docker() {{ :; }}
 findmnt() {{ printf '%s\\n' "$EXEC_ROOT/netns/default" /run/docker/netns/default; }}
 mountpoint() {{ [ ! -f "$STATE/unmounted-${{2##*/}}" ]; }}
 umount() {{ printf '%s\\n' "$*" >> "$STATE/unmounts"; touch "$STATE/unmounted-${{1##*/}}"; }}

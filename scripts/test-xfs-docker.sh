@@ -79,8 +79,14 @@ unmount_owned() {
 }
 
 down() {
-  local pid identity
+  local pid identity containers container
   if pid=$(ours) && identity=$(daemon_identity "$pid"); then
+    containers=$(docker -H "unix://$SOCK" ps -aq) || return 1
+    if [ -n "$containers" ]; then
+      while IFS= read -r container; do
+        docker -H "unix://$SOCK" rm --force -- "$container" >/dev/null || return 1
+      done <<< "$containers"
+    fi
     if daemon_identity "$pid" "$identity" >/dev/null; then
       if ! kill "$pid"; then
         if daemon_identity "$pid" "$identity" >/dev/null; then return 1; fi
