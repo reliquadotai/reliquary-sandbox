@@ -1106,15 +1106,26 @@ class TaskBoxRuntime:
             stream.close()
             return
         self._connections[exec_id] = stream
+        sender = None
+        send_errors: list[Exception] = []
         try:
             # An abort that ran before the registration above left only this flag.
             if abandon is not None and abandon.is_set():
                 return
             if stdin is not None:
-                try:
-                    stream.send_stdin(stdin)
-                except OSError:
-                    pass  # the reader quit early (EPIPE): its exit code tells why
+                def send() -> None:
+                    try:
+                        stream.send_stdin(stdin)
+                    except OSError:
+                        pass  # the reader quit early: its exit code tells why
+                    except Exception as exc:
+                        send_errors.append(exc)
+                        stream.close()  # wake the output reader on a local failure
+
+                # Output must drain while a large input is being sent: the peer
+                # can fill its output buffer or stop reading before stdin ends.
+                sender = threading.Thread(target=send, daemon=True)
+                sender.start()
             try:
                 for kind, chunk in stream.frames():
                     yield ((chunk, None) if kind == STDOUT
@@ -1123,6 +1134,10 @@ class TaskBoxRuntime:
                 pass  # the peer closed with our input unread: the exit code tells why
         finally:
             self._abort(exec_id)
+            if sender is not None:
+                sender.join(1)
+                if send_errors:
+                    raise send_errors[0]
 
     def exec(self, box_id: str, argv: list[str], *, timeout_s: float, output_limit: int,
              stdin: bytes | None = None, env: dict[str, str] | None = None,
