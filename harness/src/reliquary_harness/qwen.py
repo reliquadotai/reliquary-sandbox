@@ -18,7 +18,6 @@ from collections.abc import Callable, Sequence
 from functools import wraps
 from typing import Any
 
-from . import mini
 from .spec import BASH_VF_B2E4E81, HarnessSpec, decorate_observation
 from .variant import variant as variant_of
 
@@ -157,9 +156,6 @@ class QwenTurnRenderer:
             parsed = self._parse(completion_ids)
             texts = [parsed.content or "", *(getattr(call, "raw", "") or "" for call in parsed.tool_calls or ())]
             return self._translator.turn_calls(texts, self._offered)
-        if self._text:
-            ended = bool(completion_ids) and int(completion_ids[-1]) in self.stop_ids
-            return mini.turn_calls(self._parse(completion_ids).content or "", ended=ended)
         return self._template_calls(completion_ids)
 
     def _template_calls(self, completion_ids) -> list[tuple[str, str]]:
@@ -174,8 +170,16 @@ class QwenTurnRenderer:
     @_locked
     def tool_calls(self, completion_ids) -> list[tuple[str, str]]:
         if self._translator is not None:
-            calls = [self._translator.translate(name, arguments, self._offered)
-                     for name, arguments in self._surface_calls(completion_ids)]
+            surface = self._surface_calls(completion_ids)
+            whole_turn = getattr(self._translator, "turn_actions", None)
+            if whole_turn is not None:
+                # The harness reads the turn as a whole (mini: no call or any bad call is one format error, a
+                # submit ends the episode): `ended` is whether the turn stopped on a stop id (not at its cap).
+                ended = bool(completion_ids) and int(completion_ids[-1]) in self.stop_ids
+                surface = whole_turn(surface, ended=ended)
+                if surface is None:
+                    return []
+            calls = [self._translator.translate(name, arguments, self._offered) for name, arguments in surface]
             # A submit (None) ends the episode: the turn sends nothing.
             return [] if any(call is None for call in calls) else calls
         return [(self.canonical_name(name), arguments) for name, arguments in self._surface_calls(completion_ids)]
@@ -191,7 +195,7 @@ class QwenTurnRenderer:
         """The harness's own text for a call answered locally (mini's format errors), or None."""
         if self._translator is not None:
             return self._translator.refusal(name, arguments)
-        return mini.refusal(name, arguments) if self._text else None
+        return None
 
     def calls_of(self, parsed_calls) -> list[tuple[str, str, str]]:
         """`calls_with_ids` of a parse result's calls (the generate endpoint's), canonical names."""
@@ -232,7 +236,9 @@ class QwenTurnRenderer:
         `observation.tool_message`), or, with text actions, user messages."""
         if self._text:
             return [{"role": "user", "content": text} for text in observations]
-        return [{"role": "tool", "tool_call_id": f"call_{i}", "content": text}
+        as_user = getattr(self._translator, "user_message", None) or (lambda text: False)
+        return [{"role": "user", "content": text} if as_user(text)
+                else {"role": "tool", "tool_call_id": f"call_{i}", "content": text}
                 for i, text in enumerate(observations)]
 
     @_locked
