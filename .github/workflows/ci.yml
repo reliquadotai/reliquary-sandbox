@@ -199,3 +199,51 @@ jobs:
         with:
           junit-path: ${{ runner.temp }}/signed-episodes.xml
           test-outcome: ${{ steps.signed_tests.outcome }}
+
+  harness:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12.15"
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          version: "0.11.10"
+          python-version: "3.12.15"
+          enable-cache: true
+      - run: uv sync --all-extras --frozen
+      - run: uv pip install --no-deps --editable harness
+      - run: uv pip install 'transformers==5.20.2'
+      - name: Fetch pinned tokenizer assets
+        run: |
+          mkdir -p "$RUNNER_TEMP/tokenizers/qwen38" "$RUNNER_TEMP/tokenizers/teutonic"
+          curl --fail --location --proto "=https" --max-time 60 --max-filesize 33554432 --output "$RUNNER_TEMP/tokenizers/qwen38/tokenizer.json" "https://huggingface.co/Qwen/Qwen3.8-27B/resolve/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0/tokenizer.json"
+          echo "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3  $RUNNER_TEMP/tokenizers/qwen38/tokenizer.json" | sha256sum -c -
+          curl --fail --location --proto "=https" --max-time 60 --max-filesize 33554432 --output "$RUNNER_TEMP/tokenizers/qwen38/tokenizer_config.json" "https://huggingface.co/Qwen/Qwen3.8-27B/resolve/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0/tokenizer_config.json"
+          echo "b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27  $RUNNER_TEMP/tokenizers/qwen38/tokenizer_config.json" | sha256sum -c -
+          curl --fail --location --proto "=https" --max-time 60 --max-filesize 33554432 --output "$RUNNER_TEMP/tokenizers/teutonic/tokenizer.json" "https://huggingface.co/ReliquaryForge/teutonic-i-graft-sft-cot-v2/resolve/d5256c5ccc2c06d8f9bf3133b37ab2a5b95a224e/tokenizer.json"
+          echo "fe000e3ed39ed12b8d2481d527d44f93c65d37e87645d2dcc80d1bf9d50d2927  $RUNNER_TEMP/tokenizers/teutonic/tokenizer.json" | sha256sum -c -
+          curl --fail --location --proto "=https" --max-time 60 --max-filesize 33554432 --output "$RUNNER_TEMP/tokenizers/teutonic/tokenizer_config.json" "https://huggingface.co/ReliquaryForge/teutonic-i-graft-sft-cot-v2/resolve/d5256c5ccc2c06d8f9bf3133b37ab2a5b95a224e/tokenizer_config.json"
+          echo "85872dac6c375bb5ef7fb4ff1c5f84eb9ecb2db343d5291925beff696dfb8867  $RUNNER_TEMP/tokenizers/teutonic/tokenizer_config.json" | sha256sum -c -
+      - name: Require both recorded tokenizers
+        env:
+          RELIQUARY_HARNESS_TOKENIZERS: ${{ runner.temp }}/tokenizers/qwen38:${{ runner.temp }}/tokenizers/teutonic
+          PYTHONPATH: harness/tests
+          HF_HUB_OFFLINE: "1"
+          TRANSFORMERS_OFFLINE: "1"
+        run: uv run --no-sync python -c 'from test_qwen_goldens import TOKENIZERS; assert set(TOKENIZERS) == {"422fa18269c6e298", "cd79c4a4fa1a9867"}, TOKENIZERS'
+      - id: unit_tests
+        env:
+          RELIQUARY_HARNESS_TOKENIZERS: ${{ runner.temp }}/tokenizers/qwen38:${{ runner.temp }}/tokenizers/teutonic
+          HF_HUB_OFFLINE: "1"
+          TRANSFORMERS_OFFLINE: "1"
+        run: uv run --no-sync pytest -q harness/tests --junitxml="${{ runner.temp }}/pytest-results.xml" -o junit_logging=no -o junit_log_passing_tests=false
+      - run: uv build --project harness --out-dir "$RUNNER_TEMP/harness-dist"
+      - name: Retain test counts
+        if: always()
+        uses: ./.github/actions/test-summary
+        with:
+          junit-path: ${{ runner.temp }}/pytest-results.xml
+          test-outcome: ${{ steps.unit_tests.outcome }}
