@@ -36,4 +36,5 @@ htmlcov/
 *.review.private.md
 /reports/
 /tests/*-live-*.jsonl
+/harness/dist/
 /tests/conformance-*-20??-??.json
