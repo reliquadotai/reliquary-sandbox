@@ -34,7 +34,7 @@ markers = ["live: requires Linux Docker with gVisor (opt-in; never on production
 [tool.ruff]
 line-length = 100
 target-version = "py311"
-extend-exclude = ["src/reliquary_sandbox/_proto"]
+extend-exclude = ["src/reliquary_sandbox/_proto", "harness/tests/upstream"]
 [tool.ruff.lint]
 select = ["E", "F", "I", "E301", "E302", "E303", "E304", "E305", "E306"]
 # The blank-line rules (E30x) are preview rules: enable exactly those.
