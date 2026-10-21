@@ -28,3 +28,12 @@ htmlcov/
 *.tar*
 *.zip
 .DS_Store
+
+# Local plans, evidence, and generated reports
+/.superpowers/
+/docs/superpowers/
+/review-private/
+*.review.private.md
+/reports/
+/tests/*-live-*.jsonl
+/tests/conformance-*-20??-??.json

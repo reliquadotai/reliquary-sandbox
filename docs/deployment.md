@@ -87,7 +87,7 @@ Settings below use the `RELIQUARY_SANDBOX_` prefix, like every other controller 
 
 ### Host requirements
 
-- Linux with Docker Engine on a Unix socket, and the pinned gVisor runtime: `sudo ./scripts/bootstrap-runtime.sh --configure-docker` installs runsc `20260928.0` (SHA-512 checked). Keep `REQUIRE_GVISOR=true`. The controller compares `runsc --version` with `EPISODE_RUNSC_VERSION` and refuses `--ignore-cgroups`.
+- Linux with Docker Engine on a Unix socket, and the pinned gVisor runtime: `sudo ./scripts/bootstrap-runtime.sh --configure-docker` installs runsc `20260928.0` (SHA-512 checked) with `--overlay2=none`. Keep `REQUIRE_GVISOR=true`. The controller compares `runsc --version` with `EPISODE_RUNSC_VERSION` and refuses `--ignore-cgroups`. Quoted episode disks require the explicit `--overlay2=none` runtime argument with no conflicting overlay flags, so writes use Docker's quota-controlled layer. Qualify this configuration on a new or drained host before rollout.
 - Docker's data-root on xfs mounted with `pquota`, with the `overlay2` storage driver and the containerd image store disabled. The controller caps each box's writable root with `--storage-opt size=<disk budget>`. Preflight refuses to enable episodes unless `docker info` reports `overlay2` on xfs and a probe container created with a size option is accepted. `EPISODE_ALLOW_UNQUOTED_DISK=true` skips the check and the quota; use it for tests only.
 - A static busybox, at least 1.36, pinned by SHA-256 (`EPISODE_HELPER_BUSYBOX`, `EPISODE_HELPER_BUSYBOX_SHA256`). See "Episode hosts: the helper busybox".
 - The controller must see the Docker pidfile (`EPISODE_DOCKER_PIDFILE`, default `/var/run/docker.pid`) and `/proc`, so it can tell a daemon restart from an agent's action. A controller in a container needs both mounted read-only, and the host's `runsc` at the path Docker reports.
@@ -101,9 +101,17 @@ Settings below use the `RELIQUARY_SANDBOX_` prefix, like every other controller 
 {
   "storage-driver": "overlay2",
   "features": {"containerd-snapshotter": false},
-  "runtimes": {"runsc": {"path": "/usr/local/bin/runsc"}}
+  "runtimes": {"runsc": {"path": "/usr/local/bin/runsc", "runtimeArgs": ["--overlay2=none"]}}
 }
 ```
+
+An additional qualified x86-64 CPU VM profile for runsc `release-20260928.0` with systrap uses
+`"runtimeArgs": ["--overlay2=none", "--systrap-disable-fast-path=true"]`.
+The extra argument disables the systrap fast path; Sentry CPU remains part of measured cgroup usage.
+The bootstrap installs the baseline profile, so qualify this additional argument on a new or drained test host
+with the live CPU, isolation, quota and SDK tests before serving work.
+For the isolated XFS test daemon, set `RUNSC` to a wrapper around the pinned runtime with the same systrap argument,
+since the helper adds only `--overlay2=none`.
 
 ### Machine and validator keys
 
@@ -218,7 +226,7 @@ The fault rule: a failure is an `InfraFault` (ours, `aborted`) only when Docker 
 - A call's `cpu_ms` is the change in the box cgroup's CPU usage since the previous charge, read from Docker one-shot stats. When the controller runs on the host, `EPISODE_CPU_SOURCE=cgroupfs` reads `cpu.stat` under `EPISODE_CGROUP_ROOT` instead. The figure covers every process in the box, including gVisor's Sentry and gofer, so background jobs left by earlier calls are charged to the next call. CPU burnt after the last call is charged at `finish`. The `cpu_s` budget counts calls only; the final record's `cpu_total_ms` adds the grading box's CPU. Preparation is not counted.
 - At `finish`, before extract, every process the agent left in its box is killed (as root, with the helper busybox; PID 1 and the entrypoint stay), so the extracted state is final and nothing tampers with extraction.
 - A grading box must be created, and its CPU read once, within `EPISODE_GRADING_CREATE_TIMEOUT_S`; otherwise that attempt fails on our side (retried, then `aborted`). The bound leaves each grading step its full timeout inside the verification window, so a step cut by the window always follows our own slowness.
-- Files move through `docker exec` from the helper busybox, never `docker cp`: under runsc the box's root overlay lives inside the sandbox, where `docker cp` cannot see it.
+- Files move through `docker exec` from the helper busybox, preserving the box's user and file-operation checks. Quoted disks write directly to Docker's quota-controlled layer with `--overlay2=none`.
 
 ### Restarts
 
@@ -318,7 +326,7 @@ Under runsc, a loaded host sometimes fails to start a command in a box that is o
 OCI runtime exec failed: <path>/runsc did not terminate successfully: exit status N
 ```
 
-Only that exact message counts (anchored at both ends, nothing on stderr, no helper frame marker); text an agent or helper echoes never does. `<path>` is `.../runsc`, or the wrapper dockerd generates when the daemon configures `runtimeArgs` for the runtime: `<data-root>/runtimes/runsc.<hash>`. The detector accepts that wrapper, but never configure runsc flags through dockerd `runtimeArgs` without checking the detector against your daemon's actual message first (`--ignore-cgroups` is refused outright).
+Only that exact message counts (anchored at both ends, nothing on stderr, no helper frame marker); text an agent or helper echoes never does. `<path>` is `.../runsc`, or the wrapper dockerd generates when the daemon configures `runtimeArgs` for the runtime: `<data-root>/runtimes/runsc.<hash>`. The detector accepts that wrapper. Keep the required `--overlay2=none` argument and requalify any additional runtime arguments on the test host (`--ignore-cgroups` is refused outright).
 
 What the service does with it:
 
@@ -364,6 +372,8 @@ when set. Validators take a machine's address from their directory, never from a
 `episode_cpu_millis_total` and `episode_memory_bytes_total` (both or neither): the CPU (thousandths) and memory all live episodes' agent boxes may reserve. Each episode reserves its agent box: its task's CPUs and its memory budget. The reservable CPU is the total × `episode_cpu_overcommit` (1.0 to 4.0, measured at qualification: an agent box idles while the miner runs its model); memory is never overcommitted. An open that does not fit is refused 503 `no free resources`, one that never fits 422; on such a machine a task asking more CPUs per box than `episode_nano_cpus` is refused 422 instead of clamped. The grading boxes run in the grading pool (`episode_grading_*`, required with these totals). Set `episode_cpu_millis_total + episode_grading_cpu_millis_total` at or below the host's CPUs × 1000 and the two memory totals below the host's RAM minus the service's own needs. These totals require `episode_present_window_s` (10 to 120, the validator's present window: it stops holding an unpresented token's place after 120 s); the service refuses to start without it. The signed capacity report then carries a `resources` block (reservable totals, used, free, the per-box CPUs, the overcommit, `present_window_s`, the live session ids); validators place RL sessions only on machines that report it, and a machine that serves RL sessions must not also be placed on by a corpus validator.
 
 `episode_grading_cpu_millis_total` and `episode_grading_memory_bytes_total` (both or neither; required with the reservation totals): the grading pool. Each grading attempt's box (the task's CPUs and the token's memory) runs only inside it, entered after extract; waiters are served fairly by hotkey (the one holding the least of the pool first). A grading that cannot start while its grade step still fits is aborted by the machine: `the grading pool stayed full` when other miners' gradings held the pool (validators charge nobody and count it toward no cap), `the grading pool stayed full with this miner's own gradings` when the session's own hotkey held more than half of it (an ordinary abort). Size it at qualification so that `grading_pool.timeouts` stays at zero at the declared capacity; the signed report's `grading_pool` block shows its use, its waits and its timeouts.
+
+A new episode is refused before preparation when its grading box could never fit the configured grading pool. Closing an episode does not release resources still occupied by a container whose removal failed: agent reservations and grading pool shares remain held until cleanup succeeds, including across controller restarts. On slot-only hosts, any leftover episode box keeps its slot occupied. The periodic cleanup retries removal and releases each hold once.
 
 ## Episode hosts: the helper busybox
 
@@ -434,7 +444,7 @@ Measured live (Docker 29.1.3, runsc `release-20260928.0`, busybox-static 1.37, `
   1.8 s measured); the output the command printed before the timeout is kept (the runner's `head` buffers it until
   it drains).
   A call that leaves a background job or a `setsid` escapee returns in about 1.8 s.
-* **Disk quota.** On overlay2 over xfs `pquota`, a 256 MiB box stops at 255 MiB with `ENOSPC` inside the box (the
+* **Disk quota.** With runsc `--overlay2=none` on Docker overlay2 over xfs `pquota`, a 256 MiB box stops at its quota with `ENOSPC` inside the box (the
   Sentry keeps running), deleting frees the space, and the read-only `/etc/hosts`, `/etc/hostname`,
   `/etc/resolv.conf` and `/.reliquary` binds refuse writes (`EROFS`, `EBUSY` on rename, `ETXTBSY` on overwrite).
 * **Cost.** Median on a 2 vCPU host shared with another workload: open (create + prepare) 0.6 s, bash call 0.26 s,
@@ -457,6 +467,8 @@ The suite also reads the env's package statically and fails it when it imports a
 (`RUN_EPISODE_LIVE=1`, marker `live`) and must never run on a production machine. Run it sequentially, as root on
 the test host, once against the main daemon (whose storage is refused by preflight; the tests set
 `episode_allow_unquoted_disk`) and once against the isolated xfs daemon, which also runs the quota test:
+
+CI also runs `test_episode_resources_live.py` and `test_bridge_live.py` against the isolated XFS daemon as root, with project quotas and cgroup accounting enabled. This job fails if any selected live test is skipped. It separately runs `test_verifiers_bridge_live.py`, using the real miner harness with a local scripted model and signed gateway. These test hosts use temporary state and generated keys; they do not connect to production gateways.
 
 ```bash
 RUN_EPISODE_LIVE=1 uv run pytest -q -s -m live tests/test_episode_live.py
