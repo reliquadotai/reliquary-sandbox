@@ -27,7 +27,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-IMPLEMENTATION_FILES = ("spec.py", "qwen.py", "loop.py", "engine.py", "variant.py", "mini.py")
+IMPLEMENTATION_FILES = ("spec.py", "qwen.py", "loop.py", "engine.py", "variant.py", "mini.py", "openhands.py",
+                        "claude_code.py", "codex.py", "codex_patch.py")
 """The package modules whose source the digest covers: they decide every token."""
 
 
@@ -67,8 +68,11 @@ class HarnessSpec:
     variants: Mapping[str, Any] = field(default_factory=lambda: {"axes": []})
     upstream: Mapping[str, Any] = field(default_factory=dict)
     actions: Mapping[str, Any] = field(default_factory=lambda: {"mode": "tool-calls"})
-    """How a turn names its action: `tool-calls` (the template's function calls) or `text`
-    (mini-swe-agent: one fenced bash block in the answer; no tool is shown to the model)."""
+    """How a turn names its action: `tool-calls` (the template's function calls), `text`
+    (mini-swe-agent: one fenced bash block in the answer; no tool is shown to the model), or
+    `translated` (`harness`: the module whose own tools the model calls, written in the answer
+    when `calls` is `text`, and which writes each call as the canonical `bash` / `edit` call the
+    gateway runs and renders its record back in its own format)."""
 
     @property
     def key(self) -> str:
@@ -101,7 +105,16 @@ class HarnessSpec:
 
     @property
     def text_actions(self) -> bool:
-        return self.actions.get("mode") == "text"
+        """The model writes its actions in its answer (no tool is shown through the template)."""
+        return self.actions.get("mode") == "text" or (self.translated and self.actions.get("calls") == "text")
+
+    @property
+    def translated(self) -> bool:
+        return self.actions.get("mode") == "translated"
+
+    def translator(self):
+        """The module of a translated harness (`actions.harness`)."""
+        return translator_module(self.actions.get("harness"))
 
     def user_prompt(self, task: str) -> str:
         """The first user message: the task, inside the spec's instance template when it has one."""
@@ -123,6 +136,8 @@ class HarnessSpec:
         names = self.tool_set(tools)
         if self.text_actions:
             return ()
+        if self.translated:
+            return tuple(dict(tool) for tool in self.translator().tool_specs(names))
         surface = (values or {}).get("tools") or {}
         shown = []
         for tool in self.tools:
@@ -140,6 +155,8 @@ class HarnessSpec:
         """The enabled fragments joined; a variant's `system_prompt` axis is a fragment per
         tool, with `{bash}`/`{edit}` standing for the tools' surface names."""
         names = self.tool_set(tools)
+        if self.translated:
+            return self.translator().system_prompt(names)
         if "text" in self.system_prompt:
             return self.system_prompt["text"]
         phrased = (values or {}).get("system_prompt")
@@ -158,6 +175,20 @@ class HarnessSpec:
     def with_network_notice(self, content: str) -> str:
         notice = self.network_notice["text"]
         return f"{content}{self.network_notice['join']}{notice}" if content else notice
+
+
+TRANSLATORS = ("openhands", "claude_code", "codex")
+"""The translated harnesses this package has: each a module of the package (`openhands.py`, ...)."""
+
+
+def translator_module(name):
+    """The module of translated harness `name`: its tools, prompt, call reading, translation onto the
+    canonical tools, and the rendering of their records."""
+    if name not in TRANSLATORS:
+        raise ValueError(f"no translated harness {name!r} in this package ({list(TRANSLATORS)})")
+    import importlib
+
+    return importlib.import_module(f"{__package__}.{name}")
 
 
 def _package_dir() -> Path:
@@ -243,7 +274,7 @@ BASH_VF_B2E4E81 = HarnessSpec(
               }},
 )
 
-OBSERVATION_FORMATS = ("plain", "exit-code", "mini")
+OBSERVATION_FORMATS = ("plain", "exit-code", "mini", *TRANSLATORS)
 
 
 def decorate_observation(fmt: str, body: Mapping[str, Any], text: str) -> str:
@@ -262,6 +293,8 @@ def decorate_observation(fmt: str, body: Mapping[str, Any], text: str) -> str:
         from .mini import observation
 
         return observation(body)
+    if fmt in TRANSLATORS:
+        return translator_module(fmt).observation(body)
     raise ValueError(f"unknown observation format {fmt!r}")
 
 
@@ -314,7 +347,97 @@ def _mini_swe_v1() -> HarnessSpec:
 
 MINI_SWE_V1 = _mini_swe_v1()
 
-SPECS: dict[str, HarnessSpec] = {spec.key: spec for spec in (BASH_VF_B2E4E81, BASH_SURFACE_V1, MINI_SWE_V1)}
+OPENHANDS_COMMIT = "d39f7ae0e66174c50bdc714304fed4078b5e3b72"
+
+
+def _openhands_xml_v1() -> HarnessSpec:
+    from . import openhands
+
+    return dataclasses.replace(
+        BASH_VF_B2E4E81,
+        id="openhands-xml",
+        version="1",
+        family="openhands",
+        # The prompt is OpenHands' system prompt plus its function descriptions for the offered tools
+        # (`openhands.system_prompt`); the task is wrapped in its SWE-bench instance.
+        system_prompt={"harness": "openhands", "instance": openhands.INSTANCE},
+        parse={"filter": "one-openhands-function", "regex": openhands.FN_REGEX.pattern,
+               "parameters": openhands.PARAM_REGEX.pattern, "submit": openhands.SUBMIT_TOOL,
+               "local": [openhands.CONTINUE_CALL, openhands.ERROR_CALL, openhands.THINK_CALL],
+               "editor": "python3 str_replace_editor in bash, its first line " + openhands.EDITOR_MARK},
+        observation={"format": "reliquary-observation/1", "tools_versions": ["reliquary-tools/1"],
+                     "shown": "openhands", "message": {"role": "user"}, "truncate_chars": openhands.MAX_MESSAGE_CHARS},
+        stops={"before_model_call": ["max_turns", "episode_closed"], "after_turn": {"submit": "agent_completed"},
+               "overlong_prompt": "context_length", "closed_on_a_call": "episode_closed", "max_tokens_per_turn": "job"},
+        actions={"mode": "translated", "harness": "openhands", "calls": "text"},
+        upstream={"openhands": OPENHANDS_COMMIT,
+                  "files": ["openhands/agenthub/codeact_agent/prompts/system_prompt.j2",
+                            "openhands/agenthub/codeact_agent/tools/str_replace_editor.py",
+                            "openhands/llm/fn_call_converter.py",
+                            "evaluation/benchmarks/swe_bench/prompts/swe_default.j2"]},
+    )
+
+
+OPENHANDS_XML_V1 = _openhands_xml_v1()
+
+CLAUDE_CODE_TYPES = "@anthropic-ai/claude-agent-sdk@0.3.306 sdk-tools.d.ts (Claude Code 2.1.306)"
+
+
+def _claude_code_v1() -> HarnessSpec:
+    return dataclasses.replace(
+        BASH_VF_B2E4E81,
+        id="claude-code",
+        version="1",
+        family="claude-code",
+        # Its own prompt and tool descriptions (`claude_code.SYSTEM`, `claude_code.TOOLS`): Claude Code's tool
+        # names and parameters, not its texts. The task is the first user message as is.
+        system_prompt={"harness": "claude_code"},
+        parse={"filter": "named-calls", "arguments": "raw-string-or-json-dumps",
+               "unknown": "?<name>, answered No such tool available", "invalid": "?invalid, answered InputValidationError",
+               "files": "python3 Read/Edit/Write program in bash, its first line # claude-code:<tool>",
+               "on_error": "refuse-span"},
+        observation={"format": "reliquary-observation/1", "tools_versions": ["reliquary-tools/1"],
+                     "shown": "claude_code", "tool_message": {"role": "tool", "tool_call_id": "call_<k>"}},
+        stops={"before_model_call": ["max_turns", "episode_closed"], "after_turn": {"no_call": "agent_completed"},
+               "overlong_prompt": "context_length", "closed_on_a_call": "episode_closed", "max_tokens_per_turn": "job"},
+        actions={"mode": "translated", "harness": "claude_code", "calls": "tool-calls"},
+        upstream={"claude-code": CLAUDE_CODE_TYPES},
+    )
+
+
+CLAUDE_CODE_V1 = _claude_code_v1()
+
+CODEX_COMMIT = "c7234c1"
+
+
+def _codex_v1() -> HarnessSpec:
+    return dataclasses.replace(
+        BASH_VF_B2E4E81,
+        id="codex",
+        version="1",
+        family="codex",
+        # Codex CLI's tools and base instructions (`codex.SYSTEM`, `codex.TOOLS`; no model identity); the
+        # task is the first user message as is.
+        system_prompt={"harness": "codex"},
+        parse={"filter": "named-calls", "arguments": "raw-string-or-json-dumps",
+               "unknown": "?<name>, answered unsupported call", "invalid": "?invalid, answered its parse error",
+               "patch": "python3 apply_patch engine (codex_patch) in bash, its first line # codex:apply_patch",
+               "on_error": "refuse-span"},
+        observation={"format": "reliquary-observation/1", "tools_versions": ["reliquary-tools/1"],
+                     "shown": "codex", "tool_message": {"role": "tool", "tool_call_id": "call_<k>"}},
+        stops={"before_model_call": ["max_turns", "episode_closed"], "after_turn": {"no_call": "agent_completed"},
+               "overlong_prompt": "context_length", "closed_on_a_call": "episode_closed", "max_tokens_per_turn": "job"},
+        actions={"mode": "translated", "harness": "codex", "calls": "tool-calls"},
+        upstream={"codex": CODEX_COMMIT,
+                  "files": ["codex-rs/core/gpt-5.2-codex_prompt.md", "codex-rs/core/gpt_5_2_prompt.md",
+                            "codex-rs/core/src/tools/handlers/shell_spec.rs", "codex-rs/apply-patch/src"]},
+    )
+
+
+CODEX_V1 = _codex_v1()
+
+SPECS: dict[str, HarnessSpec] = {spec.key: spec for spec in (BASH_VF_B2E4E81, BASH_SURFACE_V1, MINI_SWE_V1,
+                                                               OPENHANDS_XML_V1, CLAUDE_CODE_V1, CODEX_V1)}
 
 
 def get_spec(harness_id: str, version: str) -> HarnessSpec:

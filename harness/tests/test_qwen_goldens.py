@@ -23,7 +23,8 @@ from reliquary_harness.spec import BASH_VF_B2E4E81  # noqa: E402
 
 GOLDENS = Path(__file__).resolve().parent / "goldens"
 TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json")
-CASES = sorted(p for p in GOLDENS.glob("*.*.json") if not p.name.startswith(("miner-loop.", "surface-variants.", "mini-swe.")))
+CASES = sorted(p for p in GOLDENS.glob("*.*.json") if not p.name.startswith(("miner-loop.", "surface-variants.", "mini-swe.", "openhands-xml.",
+                                                                              "claude-code.", "codex.")))
 
 
 def tokenizer_digest(directory) -> str:

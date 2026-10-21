@@ -92,6 +92,9 @@ class QwenTurnRenderer:
         self._hidden = frozenset(name for name in surface if surface[name] != name)
         self.observation_format = spec.observation_format(values)
         self._text = spec.text_actions
+        # A translated harness (OpenHands...): its own module reads, translates and answers the calls.
+        self._translator = spec.translator() if spec.translated else None
+        self._offered = offered
         self._r = renderer
         # P6: HF tokenizers are not thread-safe; intake, grading and export share this.
         self._lock = threading.RLock()
@@ -149,27 +152,45 @@ class QwenTurnRenderer:
         return HIDDEN_PREFIX + name if name in self._hidden else name
 
     def _surface_calls(self, completion_ids) -> list[tuple[str, str]]:
+        if self._translator is not None and self._text:
+            # The functions written in the answer, and in any call the template parser took out of it.
+            parsed = self._parse(completion_ids)
+            texts = [parsed.content or "", *(getattr(call, "raw", "") or "" for call in parsed.tool_calls or ())]
+            return self._translator.turn_calls(texts, self._offered)
         if self._text:
             ended = bool(completion_ids) and int(completion_ids[-1]) in self.stop_ids
             return mini.turn_calls(self._parse(completion_ids).content or "", ended=ended)
         return self._template_calls(completion_ids)
 
     def _template_calls(self, completion_ids) -> list[tuple[str, str]]:
-        return pinned_tool_calls(self._parse(completion_ids).tool_calls, self._unknown)
+        parsed = self._parse(completion_ids).tool_calls
+        if self._translator is not None:
+            # A translated harness answers a call to a tool it does not have (its module's error text):
+            # every named call is read, its arguments as written.
+            return [(call.name, call.arguments if isinstance(call.arguments, str) else json.dumps(call.arguments or {}))
+                    for call in parsed or [] if getattr(call, "name", None)]
+        return pinned_tool_calls(parsed, self._unknown)
 
     @_locked
     def tool_calls(self, completion_ids) -> list[tuple[str, str]]:
+        if self._translator is not None:
+            calls = [self._translator.translate(name, arguments, self._offered)
+                     for name, arguments in self._surface_calls(completion_ids)]
+            # A submit (None) ends the episode: the turn sends nothing.
+            return [] if any(call is None for call in calls) else calls
         return [(self.canonical_name(name), arguments) for name, arguments in self._surface_calls(completion_ids)]
 
     def turn_calls(self, result) -> list[tuple[str, str, str]]:
         """`(id, canonical name, arguments)` of a generate result (`renderers.client.generate`'s dict)."""
-        if self._text:
+        if self._text or self._translator is not None:
             return [(f"call_{i}", name, arguments)
                     for i, (name, arguments) in enumerate(self.tool_calls(result["completion_ids"]))]
         return self.calls_of(result.get("tool_calls"))
 
     def refusal_observation(self, name: str, arguments: str | None) -> str | None:
         """The harness's own text for a call answered locally (mini's format errors), or None."""
+        if self._translator is not None:
+            return self._translator.refusal(name, arguments)
         return mini.refusal(name, arguments) if self._text else None
 
     def calls_of(self, parsed_calls) -> list[tuple[str, str, str]]:
