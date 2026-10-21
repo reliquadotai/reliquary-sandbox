@@ -177,7 +177,7 @@ class HarnessSpec:
         return f"{content}{self.network_notice['join']}{notice}" if content else notice
 
 
-TRANSLATORS = ("openhands", "claude_code", "codex")
+TRANSLATORS = ("openhands", "claude_code", "codex", "mini")
 """The translated harnesses this package has: each a module of the package (`openhands.py`, ...)."""
 
 
@@ -274,7 +274,7 @@ BASH_VF_B2E4E81 = HarnessSpec(
               }},
 )
 
-OBSERVATION_FORMATS = ("plain", "exit-code", "mini", *TRANSLATORS)
+OBSERVATION_FORMATS = ("plain", "exit-code", *TRANSLATORS)
 
 
 def decorate_observation(fmt: str, body: Mapping[str, Any], text: str) -> str:
@@ -289,10 +289,6 @@ def decorate_observation(fmt: str, body: Mapping[str, Any], text: str) -> str:
         if type(code) is not int:
             raise ValueError("a call record's exit_code must be an integer")
         return f"[exit code: {code}]\n{text}"
-    if fmt == "mini":
-        from .mini import observation
-
-        return observation(body)
     if fmt in TRANSLATORS:
         return translator_module(fmt).observation(body)
     raise ValueError(f"unknown observation format {fmt!r}")
@@ -323,29 +319,38 @@ BASH_SURFACE_V1 = dataclasses.replace(
 )
 
 
-def _mini_swe_v1() -> HarnessSpec:
+MINI_SWE_AGENT_COMMIT = "04d809ceab9df28f9adaed044884180159172930"
+
+
+def _mini_swe_v2() -> HarnessSpec:
     from . import mini
 
     return dataclasses.replace(
         BASH_VF_B2E4E81,
         id="mini-swe",
-        version="1",
+        version="2",
         family="mini-swe-agent",
-        # bash is what runs (edit, when the env offers it, is never called); the model is shown no tool.
-        system_prompt={"text": mini.SYSTEM, "instance": mini.INSTANCE},
-        parse={"filter": "one-fenced-block", "regex": mini.ACTION_REGEX, "submit": mini.SUBMIT,
-               "errors": {"format": mini.FORMAT_ERROR_CALL, "length": mini.LENGTH_ERROR_CALL}},
+        # mini-swe-agent's SWE-bench configuration (the bash-only leaderboard's): its system prompt and instance, its
+        # one bash tool through the template's tool calls (edit, when the env offers it, is never shown).
+        system_prompt={"harness": "mini", "instance": mini.INSTANCE},
+        parse={"filter": "named-calls", "arguments": "raw-string-or-json-dumps",
+               "turn": "parse_toolcall_actions: no call, or any call not bash with a command, is the turn's format error",
+               "submit": mini.SUBMIT, "errors": {"format": mini.FORMAT_ERROR_CALL, "length": mini.LENGTH_ERROR_CALL},
+               "on_error": "refuse-span"},
         observation={"format": "reliquary-observation/1", "tools_versions": ["reliquary-tools/1"], "shown": "mini",
-                     "message": {"role": "user"}},
+                     "tool_message": {"role": "tool", "tool_call_id": "call_<k>"}, "format_error": {"role": "user"}},
         stops={"before_model_call": ["max_turns", "episode_closed"], "after_turn": {"submit": "agent_completed"},
                "overlong_prompt": "context_length", "closed_on_a_call": "episode_closed", "max_tokens_per_turn": "job"},
-        actions={"mode": "text"},
-        upstream={"mini-swe-agent": "04d809ceab9df28f9adaed044884180159172930",
-                  "files": ["src/minisweagent/config/mini_textbased.yaml", "src/minisweagent/models/utils/actions_text.py"]},
+        actions={"mode": "translated", "harness": "mini", "calls": "tool-calls"},
+        upstream={"mini-swe-agent": MINI_SWE_AGENT_COMMIT,
+                  "files": ["src/minisweagent/config/benchmarks/swebench.yaml",
+                            "src/minisweagent/models/utils/actions_toolcall.py"]},
     )
 
 
-MINI_SWE_V1 = _mini_swe_v1()
+MINI_SWE_V2 = _mini_swe_v2()
+"""The one mini-swe this package serves: mini-swe-agent's official SWE-bench harness. Its text-based form
+(`mini-swe@1`, `config/mini_textbased.yaml`) is not served."""
 
 OPENHANDS_COMMIT = "d39f7ae0e66174c50bdc714304fed4078b5e3b72"
 
@@ -436,7 +441,7 @@ def _codex_v1() -> HarnessSpec:
 
 CODEX_V1 = _codex_v1()
 
-SPECS: dict[str, HarnessSpec] = {spec.key: spec for spec in (BASH_VF_B2E4E81, BASH_SURFACE_V1, MINI_SWE_V1,
+SPECS: dict[str, HarnessSpec] = {spec.key: spec for spec in (BASH_VF_B2E4E81, BASH_SURFACE_V1, MINI_SWE_V2,
                                                                OPENHANDS_XML_V1, CLAUDE_CODE_V1, CODEX_V1)}
 
 
@@ -460,7 +465,7 @@ def digest_refusal(harness_id: str, version: str, digest: str) -> str | None:
     return None
 
 
-__all__ = ["BASH_SENTENCE", "BASH_SURFACE_V1", "MINI_SWE_V1", "BASH_TOOL", "BASH_VF_B2E4E81", "OBSERVATION_FORMATS",
+__all__ = ["BASH_SENTENCE", "BASH_SURFACE_V1", "MINI_SWE_V2", "BASH_TOOL", "BASH_VF_B2E4E81", "OBSERVATION_FORMATS",
            "decorate_observation", "CAPABILITY_NOTICE", "EDIT_SENTENCE", "EDIT_TOOL",
            "HarnessSpec", "SPECS", "VERIFIERS_COMMIT", "canonical_json", "digest_refusal", "get_spec",
            "harness_digest", "implementation_sha256"]
