@@ -1,0 +1,179 @@
+name: signed CLI CPU probe
+
+on:
+  pull_request:
+    paths:
+      - src/reliquary_sandbox_verifiers/cli*.py
+      - scripts/cli-probe/**
+      - tests/test_cli*.py
+      - .github/workflows/cli-probe.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: signed-cli-cpu-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      DOCKER_HOST: unix:///run/reliquary-xfs-docker.sock
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.12.15"
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e
+        with:
+          version: "0.11.10"
+          python-version: "3.12.15"
+          enable-cache: true
+      - run: uv sync --all-extras --frozen
+      - name: Fetch the reviewed native model boundary
+        run: |
+          git clone --filter=blob:none --no-checkout https://github.com/reliquadotai/reliquary.git "$RUNNER_TEMP/native"
+          git -C "$RUNNER_TEMP/native" checkout --detach df393c1bdd8873b263f268619831365d0e414f5e
+      - name: Install the isolated signed-episode test daemon
+        env:
+          DOCKER_HOST: unix:///var/run/docker.sock
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y busybox-static xfsprogs
+          sudo ./scripts/bootstrap-runtime.sh --configure-docker
+          sudo ./scripts/test-xfs-docker.sh up
+      - name: Build the prepared CLI fixture from immutable base digests
+        timeout-minutes: 12
+        env:
+          DOCKER_HOST: unix:///var/run/docker.sock
+        run: |
+          docker pull node:22.19.0-bookworm-slim
+          docker pull python:3.12.13-slim-bookworm
+          docker pull ubuntu:22.04
+          uv run --no-sync python - <<'PY'
+          import hashlib, os, pathlib, shutil, subprocess
+          from verifiers.v1.acp import ACP_SOURCE
+          root = pathlib.Path(os.environ["RUNNER_TEMP"]) / "cli-context"
+          root.mkdir()
+          for name in ("Dockerfile", "package.json", "package-lock.json", "requirements.txt"):
+              shutil.copyfile(pathlib.Path("scripts/cli-probe") / name, root / name)
+          assert hashlib.sha256(ACP_SOURCE.encode()).hexdigest() == "68fef2c97303a759e453e2f6d014aa730a91a3d60484d9e933cbbf7567c5a42c"
+          (root / "acp-runner.py").write_text(ACP_SOURCE)
+          def digest(image):
+              return subprocess.check_output(["docker", "inspect", "--format", "{{index .RepoDigests 0}}", image], text=True, timeout=15).strip()
+          subprocess.run(["docker", "build", "--build-arg", "NODE_BASE=" + digest("node:22.19.0-bookworm-slim"),
+                          "--build-arg", "PYTHON_BASE=" + digest("python:3.12.13-slim-bookworm"),
+                          "--iidfile", str(root / "image-id"), str(root)], check=True, timeout=600)
+          image = (root / "image-id").read_text().strip()
+          target = "unix:///run/reliquary-xfs-docker.sock"
+          # The isolated test bridge deliberately has no Internet NAT. Build on
+          # the ordinary CI daemon, then move exact bytes through a pipe only.
+          saved = subprocess.Popen(["docker", "save", image], stdout=subprocess.PIPE)
+          try:
+              subprocess.run(["docker", "--host", target, "load"], stdin=saved.stdout,
+                             check=True, timeout=120)
+              saved.stdout.close()
+              assert saved.wait(timeout=15) == 0
+          finally:
+              if saved.poll() is None:
+                  saved.kill()
+                  saved.wait(timeout=5)
+          loaded = subprocess.check_output(["docker", "--host", target, "inspect", "--format", "{{.Id}}", image], text=True, timeout=15).strip()
+          assert loaded == image
+          task_image = digest("ubuntu:22.04")
+          subprocess.run(["docker", "--host", target, "pull", task_image], check=True, timeout=120)
+          with open(os.environ["GITHUB_ENV"], "a") as out:
+              out.write("CLI_PROBE_IMAGE=" + image + "\n")
+              out.write("CLI_PROBE_TASK_IMAGE=" + task_image + "\n")
+          PY
+        shell: bash
+      - name: Exercise actual pinned CLI processes through signed tools
+        env:
+          PYTHONPATH: ${{ github.workspace }}/src:${{ github.workspace }}/tests:${{ github.workspace }}/harness/src:${{ runner.temp }}/native
+          RELIQUARY_SCORING_UNPRIVILEGED_OK: "1"
+        run: |
+          for protocol in signed-claude-code-cli-v1; do
+            if ! uv run --no-sync python scripts/cli-probe/probe.py \
+              --protocol "$protocol" --image "$CLI_PROBE_IMAGE" \
+              --task-image "$CLI_PROBE_TASK_IMAGE" --out "$RUNNER_TEMP/$protocol"; then
+              status=1
+            fi
+          done
+          exit "${status:-0}"
+      - name: Encrypt private synthetic probe evidence for local review
+        id: evidence
+        if: always()
+        timeout-minutes: 1
+        run: |
+          umask 077
+          ulimit -f 16384
+          python - <<'PY' | timeout --signal=TERM --kill-after=2s 20s openssl cms -encrypt -aes-256-gcm -stream -binary -outform DER -recip scripts/cli-probe/recipient.crt -out "$RUNNER_TEMP/probe-evidence.cms"
+          import json, os, pathlib, sys
+          root = pathlib.Path(os.environ["RUNNER_TEMP"])
+          evidence = {}
+          for protocol in ("signed-codex-cli-v1", "signed-claude-code-cli-v1"):
+              for name in ("synthetic-initial-request.private.json", "synthetic-alternate-initial-request.private.json", "failure.private.json", "native-failure.private.json", "synthetic-bash-48.private.json"):
+                  path = root / protocol / name
+                  if path.exists():
+                      assert path.stat().st_size <= 2 * 1024 * 1024
+                      evidence[protocol + "/" + name] = json.loads(path.read_text())
+          json.dump(evidence, sys.stdout)
+          PY
+      - name: Retain only recipient-encrypted synthetic evidence
+        if: always() && steps.evidence.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: encrypted-cli-probe-evidence
+          retention-days: 1
+          compression-level: 0
+          path: ${{ runner.temp }}/probe-evidence.cms
+          if-no-files-found: error
+      - name: Encrypt the exact tested runtime for private retention
+        id: retain
+        if: always() && env.CLI_PROBE_IMAGE != ''
+        timeout-minutes: 3
+        run: timeout --signal=TERM --kill-after=10s 120s bash scripts/cli-probe/retain-image.sh "$CLI_PROBE_IMAGE" "$RUNNER_TEMP/runtime-retention"
+      - name: Retain only encrypted runtime bytes and safe integrity metadata
+        if: always() && steps.retain.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: encrypted-cli-runtime
+          retention-days: 1
+          compression-level: 0
+          path: |
+            ${{ runner.temp }}/runtime-retention/runtime.cms
+            ${{ runner.temp }}/runtime-retention/summary.json
+          if-no-files-found: error
+      - name: Report sanitized acceptance only
+        if: always()
+        run: |
+          python - <<'PY'
+          import json, os, pathlib
+          root = pathlib.Path(os.environ["RUNNER_TEMP"])
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write("Scripted CPU fixture only; no model weights, GPU, deployment or approved capability.\n\n")
+              for protocol in ("signed-codex-cli-v1", "signed-claude-code-cli-v1"):
+                  path = root / protocol / "summary.json"
+                  result = json.loads(path.read_text()) if path.exists() else {"status": "unavailable"}
+                  summary.write(f"- {protocol}: {result['status']}\n")
+          PY
+      - name: Retain sanitized CPU acceptance summaries
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: signed-cli-cpu-summary
+          retention-days: 7
+          path: |
+            ${{ runner.temp }}/signed-codex-cli-v1/summary.json
+            ${{ runner.temp }}/signed-claude-code-cli-v1/summary.json
+          if-no-files-found: ignore
+      - name: Stop only the isolated test daemon
+        if: always()
+        env:
+          DOCKER_HOST: unix:///var/run/docker.sock
+        run: sudo ./scripts/test-xfs-docker.sh purge

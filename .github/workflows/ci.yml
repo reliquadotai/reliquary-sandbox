@@ -44,6 +44,27 @@ jobs:
       - id: unit_tests
         run: uv run pytest -q -m "not live" --junitxml="${{ runner.temp }}/pytest-results.xml" -o junit_logging=no -o junit_log_passing_tests=false
       - run: uv build
+      - name: Check the capability from the installed wheel
+        run: |
+          uv pip install --python .venv/bin/python --no-deps --target "$RUNNER_TEMP/installed-wheel" dist/*.whl
+          cd "$RUNNER_TEMP"
+          PYTHONPATH="$RUNNER_TEMP/installed-wheel" "$GITHUB_WORKSPACE/.venv/bin/python" - <<'PY'
+          import os
+          from pathlib import Path
+          from reliquary_sandbox_verifiers import cli
+          from reliquary_sandbox_verifiers.cli_runner import capability_sha256
+          installed = Path(os.environ["RUNNER_TEMP"]) / "installed-wheel"
+          assert installed in Path(cli.__file__).resolve().parents
+          cap = cli.qualified_capability("signed-claude-code-cli-v1")
+          assert capability_sha256(cap) == "748cb39764e33d9bb35842bfc441a64c53c631822026da53ac7e1a9cf075757b"
+          try:
+              cli.qualified_capability("signed-codex-cli-v1")
+          except cli.CLIUnavailable:
+              pass
+          else:
+              raise AssertionError("an unqualified CLI was enabled")
+          print("Installed wheel: sealed CPU mediation identity verified")
+          PY
       - name: Check runtime installer syntax
         run: bash -n scripts/bootstrap-runtime.sh
 

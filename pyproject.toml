@@ -12,7 +12,7 @@ dependencies = [
 ]
 [project.optional-dependencies]
 service = ["fastapi>=0.115,<1", "uvicorn[standard]>=0.30,<1", "docker>=7,<8", "pydantic-settings>=2,<3", "python-multipart>=0.0.20"]
-verifiers = ["verifiers @ git+https://github.com/PrimeIntellect-ai/verifiers.git@b2e4e8157783b2c0dffc7821044c87f29f1c3ccf"]
+verifiers = ["verifiers @ git+https://github.com/PrimeIntellect-ai/verifiers.git@b2e4e8157783b2c0dffc7821044c87f29f1c3ccf", "uvicorn>=0.30,<1"]
 dev = ["pytest>=8,<10", "pytest-asyncio>=0.23,<2", "ruff>=0.13,<1", "build>=1,<2"]
 [project.scripts]
 reliquary-sandbox = "reliquary_sandbox.cli:main"
