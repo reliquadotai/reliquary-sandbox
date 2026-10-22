@@ -327,6 +327,10 @@ async def execute(args):
         args.stage = "signed-48-turn-acceptance"
         full_budget = await signed_acceptance(args, cap, gateway, 48,
                                                model=ALTERNATE_MODEL, prompt=ALTERNATE_PROMPT)
+        from bash_probe import signed_bash_acceptance
+
+        args.stage = "signed-bash-v2-48-turn-acceptance"
+        terminal = await signed_bash_acceptance(args, gateway)
     return {"status": "passed", "protocol_id": args.protocol, "approved": False,
             "model_execution": "scripted CPU fixture; no model weights or inference",
             "cli_and_acp": CLI_VERSIONS[args.protocol], "runtime_image": args.image,
@@ -346,7 +350,7 @@ async def execute(args):
             "native_model_wire_source_sha256": hashlib.sha256(Path(inspect.getfile(model_wire)).read_bytes()).hexdigest(),
             "fresh_model_and_task_prefix_equal": True, "default_context_absence": portable,
             "initial_template_sha256": cap.initial_template_sha256,
-            "smoke": smoke, "full_budget": full_budget,
+            "smoke": smoke, "full_budget": full_budget, "terminal_48": terminal,
             "process_cleanup": "owned CLI containers verified absent"}
 
 
@@ -404,6 +408,10 @@ def main():
         if getattr(args, "native", None) is not None:
             summary["scripted_generator_calls"] = args.generator.calls
             summary["native_model_turns"] = args.native.turns
+        if getattr(args, "bash_generator", None) is not None:
+            summary["bash_scripted_generator_calls"] = args.bash_generator.calls
+        if getattr(args, "bash_native", None) is not None:
+            summary["bash_native_model_turns"] = args.bash_native.turns
     (args.out / "summary.json").write_bytes(canonical_json(summary) + b"\n")
     print(json.dumps({key: summary[key] for key in ("status", "protocol_id", "approved")}))
     return 0 if summary["status"] == "passed" else 1

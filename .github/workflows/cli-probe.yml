@@ -38,7 +38,7 @@ jobs:
       - name: Fetch the reviewed native model boundary
         run: |
           git clone --filter=blob:none --no-checkout https://github.com/reliquadotai/reliquary.git "$RUNNER_TEMP/native"
-          git -C "$RUNNER_TEMP/native" checkout --detach 5dde09c5b6118876524189e4992fc80e35e54e2d
+          git -C "$RUNNER_TEMP/native" checkout --detach df393c1bdd8873b263f268619831365d0e414f5e
       - name: Install the isolated signed-episode test daemon
         env:
           DOCKER_HOST: unix:///var/run/docker.sock
@@ -94,7 +94,7 @@ jobs:
         shell: bash
       - name: Exercise actual pinned CLI processes through signed tools
         env:
-          PYTHONPATH: ${{ github.workspace }}/src:${{ github.workspace }}/tests:${{ runner.temp }}/native
+          PYTHONPATH: ${{ github.workspace }}/src:${{ github.workspace }}/tests:${{ github.workspace }}/harness/src:${{ runner.temp }}/native
           RELIQUARY_SCORING_UNPRIVILEGED_OK: "1"
         run: |
           for protocol in signed-claude-code-cli-v1; do
@@ -117,7 +117,7 @@ jobs:
           root = pathlib.Path(os.environ["RUNNER_TEMP"])
           evidence = {}
           for protocol in ("signed-codex-cli-v1", "signed-claude-code-cli-v1"):
-              for name in ("synthetic-initial-request.private.json", "synthetic-alternate-initial-request.private.json", "failure.private.json", "native-failure.private.json"):
+              for name in ("synthetic-initial-request.private.json", "synthetic-alternate-initial-request.private.json", "failure.private.json", "native-failure.private.json", "synthetic-bash-48.private.json"):
                   path = root / protocol / name
                   if path.exists():
                       assert path.stat().st_size <= 2 * 1024 * 1024
