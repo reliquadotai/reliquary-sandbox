@@ -226,6 +226,7 @@ class SignedCLITransport:
                 else:
                     # ACP otherwise chooses its SDK's bundled native executable.
                     config.env["CLAUDE_CODE_EXECUTABLE"] = binary
+                    config.env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
                     config.session_meta["claudeCode"]["options"]["tools"] = []
                     config.session_meta["claudeCode"]["options"]["settingSources"] = []
                 process = await runtime.open_process(list(cap.runner_argv), config.env)
