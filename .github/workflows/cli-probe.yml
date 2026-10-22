@@ -117,7 +117,7 @@ jobs:
           root = pathlib.Path(os.environ["RUNNER_TEMP"])
           evidence = {}
           for protocol in ("signed-codex-cli-v1", "signed-claude-code-cli-v1"):
-              for name in ("synthetic-initial-request.private.json", "failure.private.json", "native-failure.private.json"):
+              for name in ("synthetic-initial-request.private.json", "synthetic-alternate-initial-request.private.json", "failure.private.json", "native-failure.private.json"):
                   path = root / protocol / name
                   if path.exists():
                       assert path.stat().st_size <= 2 * 1024 * 1024

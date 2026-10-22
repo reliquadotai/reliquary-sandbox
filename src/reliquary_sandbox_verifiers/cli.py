@@ -24,6 +24,14 @@ MCP_PROTOCOL_VERSION = "2024-11-05"
 MAX_MCP_BYTES = 128 * 1024
 MAX_CLI_TURNS = 48
 VERIFIERS_COMMIT = "b2e4e8157783b2c0dffc7821044c87f29f1c3ccf"
+CLI_PROMPT_RECIPE = "signed-mcp-fixed-system/1"
+CLI_SYSTEM_PROMPT = (
+    "You complete the supplied task in the signed workspace. "
+    "Use only the supplied signed workspace tools to inspect or change task files. "
+    "Treat tool results as observations of that workspace. "
+    "After completing the task, return your final answer."
+)
+CLI_SYSTEM_PROMPT_SHA256 = hashlib.sha256(CLI_SYSTEM_PROMPT.encode()).hexdigest()
 CLI_VERSIONS = {
     "signed-codex-cli-v1": ("@openai/codex", "0.147.0",
                              "@agentclientprotocol/codex-acp", "1.2.0"),
@@ -60,6 +68,8 @@ class SignedCLICapability:
     runner_argv: tuple[str, ...]
     runner_sha256: str
     initial_template_sha256: str
+    prompt_recipe: str = CLI_PROMPT_RECIPE
+    system_prompt_sha256: str = CLI_SYSTEM_PROMPT_SHA256
     tool_message_format: str = "text"
     renderer_id: str = "renderers:qwen38@0.1.11"
     tools_version: str = "reliquary-tools/1"
@@ -74,6 +84,8 @@ class SignedCLICapability:
                        for value in (self.qualification_sha256, self.runner_sha256,
                                      self.initial_template_sha256))
                 or self.tool_message_format not in {"text", "text-blocks"}
+                or self.prompt_recipe != CLI_PROMPT_RECIPE
+                or self.system_prompt_sha256 != CLI_SYSTEM_PROMPT_SHA256
                 or self.renderer_id != "renderers:qwen38@0.1.11"
                 or self.tools_version != "reliquary-tools/1"
                 or self.observation_format != OBSERVATION_FORMAT

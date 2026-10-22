@@ -3,6 +3,7 @@
 import asyncio
 import copy
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 
 import httpx
@@ -13,6 +14,7 @@ pytest.importorskip("verifiers.v1")
 from reliquary_sandbox.attest.canonical import canonical_json
 from reliquary_sandbox.tool_routing import RoutingError, ToolRouter
 from reliquary_sandbox_verifiers.cli import (
+    CLI_SYSTEM_PROMPT,
     MCP_TOOLS,
     CLIUnavailable,
     SignedCLICapability,
@@ -41,6 +43,19 @@ def capability():
         runner_argv=("/opt/signed-cli/runtime/bin/python", "/opt/signed-cli/acp-runner.py"),
         runner_sha256="c" * 64,
         initial_template_sha256=initial_template_sha256(PREFIX, "the trusted task"))
+
+
+def test_fixed_prompt_identity_cannot_be_replaced_by_a_caller(capability):
+    with pytest.raises(ValueError, match="capability identity"):
+        replace(capability, system_prompt_sha256="f" * 64)
+    with pytest.raises(ValueError, match="capability identity"):
+        replace(capability, prompt_recipe="caller-provided")
+    first = [{"role": "system", "content": CLI_SYSTEM_PROMPT},
+             {"role": "user", "content": "first trusted task"}]
+    second = [{"role": "system", "content": CLI_SYSTEM_PROMPT},
+              {"role": "user", "content": "second trusted task"}]
+    assert initial_template_sha256(first, "first trusted task") == initial_template_sha256(
+        second, "second trusted task")
 
 
 class Episode:

@@ -29,7 +29,13 @@ from verifiers.v1.runtimes import Runtime, RuntimeProcess
 from verifiers.v1.runtimes.docker import DockerConfig, DockerRuntime, docker
 from verifiers.v1.task import TaskData
 
-from .cli import CLIUnavailable, SignedCLICapability, SignedCLIToolBridge, qualified_capability
+from .cli import (
+    CLI_SYSTEM_PROMPT,
+    CLIUnavailable,
+    SignedCLICapability,
+    SignedCLIToolBridge,
+    qualified_capability,
+)
 
 MAX_PACKET_BYTES = 1024 * 1024
 CLEANUP_TIMEOUT_S = 40.0
@@ -227,6 +233,8 @@ class SignedCLITransport:
                     # ACP otherwise chooses its SDK's bundled native executable.
                     config.env["CLAUDE_CODE_EXECUTABLE"] = binary
                     config.env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
+                    config.env["CLAUDE_CODE_ATTRIBUTION_HEADER"] = "0"
+                    config.session_meta["systemPrompt"] = CLI_SYSTEM_PROMPT
                     config.session_meta["claudeCode"]["options"]["tools"] = []
                     config.session_meta["claudeCode"]["options"]["settingSources"] = []
                 process = await runtime.open_process(list(cap.runner_argv), config.env)

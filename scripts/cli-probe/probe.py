@@ -14,9 +14,12 @@ import hashlib
 import json
 import logging
 import os
+import platform
+import re
 import secrets
 import time
 import traceback
+from datetime import datetime, timezone
 from pathlib import Path
 
 from reliquary.eval.protocol import digest
@@ -56,6 +59,8 @@ from reliquary_sandbox_verifiers.cli_transport import (
 
 PROMPT = "Use the signed workspace tools to write 41, edit it to 42, read it, then reply done."
 MODEL = "fixture/signed-cli@" + "a" * 40
+ALTERNATE_PROMPT = "With the signed workspace tools, write 41, replace it with 42, read it, and finish with done."
+ALTERNATE_MODEL = "fixture/another-checkpoint@" + "b" * 40
 
 
 class ProbeTransport(SignedCLITransport):
@@ -76,13 +81,16 @@ class NoCalls:
 
 
 class Discovery(Client):
-    def __init__(self):
+    def __init__(self, model):
+        self.model = model
         self.found = asyncio.Event()
         self.messages, self.tools = None, None
         self.raw_tools_count = 0
         self.raw_tools = []
 
     async def get_response(self, dialect, body, sampling, **kwargs):
+        if body.get("model") != self.model:
+            raise ValueError("the actual CLI requested another model identity")
         self.raw_tools = body.get("tools") or []
         self.raw_tools_count = len(self.raw_tools)
         request = dialect.parse_request(body)
@@ -174,9 +182,9 @@ def capability(args):
 
 
 @contextlib.asynccontextmanager
-async def model_endpoint(client):
+async def model_endpoint(client, model=MODEL):
     config = EvalClientConfig(base_url="http://127.0.0.1:1", api_key_var="UNUSED_CLI_PROBE_KEY")
-    context = ModelContext(model=MODEL, client=config, sampling=Sampling(max_tokens=512))
+    context = ModelContext(model=model, client=config, sampling=Sampling(max_tokens=512))
     trace = Trace(task=TraceTask(type="synthetic-cpu-cli", data={}),
                   agent=AgentInfo(config=AgentConfig()))
     async with InterceptionServer() as server:
@@ -185,17 +193,18 @@ async def model_endpoint(client):
             yield url + "/v1", token
 
 
-async def signed_acceptance(args, cap, gateway, turns):
+async def signed_acceptance(args, cap, gateway, turns, *, model=MODEL, prompt=PROMPT):
     token = gateway.issue(env="live-env", split="train", index=0, image=args.task_image,
                           budgets=default_budgets(wall_s=600, cpu_s=120, max_calls=64))
     async with EpisodeClient(gateway.url) as client:
         episode = await client.open(token)
         try:
             bridge = SignedCLIToolBridge(ToolRouter(episode, offered=("bash", "edit")),
-                                         cap, prompt=PROMPT)
+                                         cap, prompt=prompt)
             generator = ScriptedGenerator(cap, turns)
+            repo, revision = model.rsplit("@", 1)
             native = model_client(generator, task={
-                "model": {"repo": "fixture/signed-cli", "revision": "a" * 40},
+                "model": {"repo": repo, "revision": revision},
                 "protocol": {"max_turns": 48, "max_episode_tokens": 65536},
                 "thinking": False, "max_new_tokens": 512, "sampling": {}},
                 source={"tools_sha256": digest(cap.model_tools),
@@ -204,10 +213,10 @@ async def signed_acceptance(args, cap, gateway, turns):
             args.native, args.generator = native, generator
             with serve_app(SignedMCPApp(bridge, path := secrets.token_hex(24))) as mcp:
                 captured = CaptureFailure(native, args.out / "native-failure.private.json")
-                async with model_endpoint(captured) as (endpoint, secret):
+                async with model_endpoint(captured, model) as (endpoint, secret):
                     result = await ProbeTransport(cap).run(
-                        model=MODEL, endpoint=endpoint, secret=secret,
-                        mcp_url=mcp + "/" + path, prompt=PROMPT, bridge=bridge,
+                        model=model, endpoint=endpoint, secret=secret,
+                        mcp_url=mcp + "/" + path, prompt=prompt, bridge=bridge,
                         deadline=asyncio.get_running_loop().time() + 240)
             if turns == 48:
                 dialect = (ResponsesDialect() if args.protocol == "signed-codex-cli-v1"
@@ -232,17 +241,15 @@ async def signed_acceptance(args, cap, gateway, turns):
             "graded_reward": 1.0, "attempt_49_refused_before_generator": turns == 48}
 
 
-async def execute(args):
-    args.stage = "schema-discovery"
-    cap = capability(args)
-    discovery = Discovery()
+async def discover(args, cap, *, model, prompt, filename):
+    discovery = Discovery(model)
     args.discovery = discovery
-    dummy = SignedCLIToolBridge(ToolRouter(NoCalls()), cap, prompt=PROMPT)
+    dummy = SignedCLIToolBridge(ToolRouter(NoCalls()), cap, prompt=prompt)
     with serve_app(SignedMCPApp(dummy, path := secrets.token_hex(24))) as mcp:
-        async with model_endpoint(discovery) as (endpoint, secret):
+        async with model_endpoint(discovery, model) as (endpoint, secret):
             task = asyncio.create_task(ProbeTransport(cap).run(
-                model=MODEL, endpoint=endpoint, secret=secret, mcp_url=mcp + "/" + path,
-                prompt=PROMPT, bridge=dummy, deadline=asyncio.get_running_loop().time() + 120))
+                model=model, endpoint=endpoint, secret=secret, mcp_url=mcp + "/" + path,
+                prompt=prompt, bridge=dummy, deadline=asyncio.get_running_loop().time() + 120))
             found = asyncio.create_task(discovery.found.wait())
             try:
                 done, _ = await asyncio.wait((task, found), return_when=asyncio.FIRST_COMPLETED)
@@ -254,8 +261,16 @@ async def execute(args):
                 with contextlib.suppress(asyncio.CancelledError, RuntimeError):
                     await task
                 found.cancel()
-    (args.out / "synthetic-initial-request.private.json").write_bytes(canonical_json({
+    (args.out / filename).write_bytes(canonical_json({
         "messages": discovery.messages, "tools": discovery.tools, "raw_tools": discovery.raw_tools}))
+    return discovery
+
+
+async def execute(args):
+    args.stage = "schema-discovery"
+    cap = capability(args)
+    discovery = await discover(args, cap, model=MODEL, prompt=PROMPT,
+                               filename="synthetic-initial-request.private.json")
     names = {tool["function"]["name"] for tool in discovery.tools}
     args.stage = "exact-mcp-schema-check"
     if (names != {name for name, _ in cap.model_tool_names} or len(discovery.tools) != 2
@@ -263,6 +278,21 @@ async def execute(args):
         raise ValueError("the actual CLI did not expose exactly the two signed MCP tools")
     cap = dataclasses.replace(cap, model_tools_json=canonical_json(discovery.tools),
         initial_template_sha256=initial_template_sha256(discovery.messages, PROMPT))
+    args.stage = "fresh-model-task-prefix-repeatability"
+    alternate = await discover(args, cap, model=ALTERNATE_MODEL, prompt=ALTERNATE_PROMPT,
+                               filename="synthetic-alternate-initial-request.private.json")
+    cap.require_model_tools(alternate.tools)
+    if (alternate.raw_tools_count != 2 or initial_template_sha256(
+            alternate.messages, ALTERNATE_PROMPT) != cap.initial_template_sha256):
+        raise ValueError("the actual CLI prefix or tools changed across model/task identities")
+    prefix = canonical_json(discovery.messages).decode().replace(PROMPT, "<signed-task-prompt>")
+    portable = {"no_model_identity": MODEL not in prefix and ALTERNATE_MODEL not in prefix,
+                "no_kernel": platform.release() not in prefix,
+                "no_workspace_path": "/workspace" not in prefix,
+                "no_controller_date": datetime.now(timezone.utc).date().isoformat() not in prefix,
+                "no_iso_dates": re.search(r"\b\d{4}-\d{2}-\d{2}\b", prefix) is None}
+    if not all(portable.values()):
+        raise ValueError("the actual CLI retained default environment/model/date context")
     args.stage = "signed-real-workspace-acceptance"
     busybox = Path(args.busybox)
     with local_gateway(args.out / "gateway", envs={"live-env": "live_episode_env:sandbox_task"},
@@ -273,7 +303,8 @@ async def execute(args):
                        ) as gateway:
         smoke = await signed_acceptance(args, cap, gateway, 4)
         args.stage = "signed-48-turn-acceptance"
-        full_budget = await signed_acceptance(args, cap, gateway, 48)
+        full_budget = await signed_acceptance(args, cap, gateway, 48,
+                                               model=ALTERNATE_MODEL, prompt=ALTERNATE_PROMPT)
     return {"status": "passed", "protocol_id": args.protocol, "approved": False,
             "model_execution": "scripted CPU fixture; no model weights or inference",
             "cli_and_acp": CLI_VERSIONS[args.protocol], "runtime_image": args.image,
@@ -285,6 +316,8 @@ async def execute(args):
                 "@anthropic-ai/claude-agent-sdk-linux-x64"],
             "model_tools_sha256": cap.model_tools_sha256,
             "model_tools_count": len(cap.model_tools),
+            "prompt_recipe": cap.prompt_recipe, "system_prompt_sha256": cap.system_prompt_sha256,
+            "fresh_model_and_task_prefix_equal": True, "default_context_absence": portable,
             "initial_template_sha256": cap.initial_template_sha256,
             "smoke": smoke, "full_budget": full_budget,
             "process_cleanup": "owned CLI containers verified absent"}
