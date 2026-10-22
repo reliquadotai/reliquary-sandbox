@@ -27,6 +27,7 @@ RUN mkdir -p /var/tmp/vf-node/bin /var/tmp/vf-codex-0.147.0-1.2.0 \
     useradd --uid 10001 --gid 10001 --home-dir /home/runner --no-create-home runner && \
     chown 10001:10001 /workspace /home/runner
 ENV HOME=/home/runner
+ENV TZ=UTC
 USER 10001:10001
 WORKDIR /workspace
 ENTRYPOINT []

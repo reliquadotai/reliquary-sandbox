@@ -13,6 +13,7 @@ import hmac
 import json
 import re
 from dataclasses import dataclass
+from datetime import date, datetime, timezone
 from typing import Any
 
 from reliquary_sandbox.attest.canonical import canonical_json
@@ -32,6 +33,10 @@ CLI_SYSTEM_PROMPT = (
     "After completing the task, return your final answer."
 )
 CLI_SYSTEM_PROMPT_SHA256 = hashlib.sha256(CLI_SYSTEM_PROMPT.encode()).hexdigest()
+CLI_DATE_RECIPE = "claude-current-date/1"
+CLI_DATE_MARKER = "<native-episode-date>"
+CLI_DATE_REMINDER_TEMPLATE_SHA256 = "bfc995c6dbbbd636bba1a69ea1b97f24e812352799fe15a88e30aa21f1b1f165"
+ISO_DATE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
 CLI_VERSIONS = {
     "signed-codex-cli-v1": ("@openai/codex", "0.147.0",
                              "@agentclientprotocol/codex-acp", "1.2.0"),
@@ -68,6 +73,7 @@ class SignedCLICapability:
     runner_argv: tuple[str, ...]
     runner_sha256: str
     initial_template_sha256: str
+    date_recipe: str | None
     prompt_recipe: str = CLI_PROMPT_RECIPE
     system_prompt_sha256: str = CLI_SYSTEM_PROMPT_SHA256
     tool_message_format: str = "text"
@@ -84,6 +90,7 @@ class SignedCLICapability:
                        for value in (self.qualification_sha256, self.runner_sha256,
                                      self.initial_template_sha256))
                 or self.tool_message_format not in {"text", "text-blocks"}
+                or self.date_recipe not in {None, CLI_DATE_RECIPE}
                 or self.prompt_recipe != CLI_PROMPT_RECIPE
                 or self.system_prompt_sha256 != CLI_SYSTEM_PROMPT_SHA256
                 or self.renderer_id != "renderers:qwen38@0.1.11"
@@ -119,6 +126,10 @@ class SignedCLICapability:
     def model_tools_sha256(self) -> str:
         return hashlib.sha256(self.model_tools_json).hexdigest()
 
+    @property
+    def date_template_sha256(self) -> str | None:
+        return CLI_DATE_REMINDER_TEMPLATE_SHA256 if self.date_recipe else None
+
     def require_model_tools(self, tools: Any) -> None:
         if canonical_json(tools) != self.model_tools_json:
             raise RoutingError("the CLI offered tools outside its qualified MCP-only schema")
@@ -140,7 +151,39 @@ def mcp_result(text: str) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": text}], "isError": False}
 
 
-def initial_template_sha256(messages: list[dict[str, Any]], prompt: str) -> str:
+def utc_context_date() -> str:
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+def require_context_date(value: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError("the signed CLI context date must be a canonical ISO date")
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError:
+        raise ValueError("the signed CLI context date must be a canonical ISO date") from None
+    if parsed.isoformat() != value:
+        raise ValueError("the signed CLI context date must be a canonical ISO date")
+    return value
+
+
+def _canonical_date_block(text: str, context_date: str, template_sha256: str) -> str:
+    require_context_date(context_date)
+    if not isinstance(text, str):
+        raise RoutingError("the native CLI date reminder must be text")
+    matches = list(ISO_DATE.finditer(text))
+    if len(matches) != 1 or matches[0].group() != context_date:
+        raise RoutingError("the native CLI date differs from the signed episode date")
+    match = matches[0]
+    template = text[:match.start()] + CLI_DATE_MARKER + text[match.end():]
+    if not hmac.compare_digest(hashlib.sha256(template.encode()).hexdigest(), template_sha256):
+        raise RoutingError("the native CLI date reminder differs from its pinned structure")
+    return template
+
+
+def initial_template_sha256(messages: list[dict[str, Any]], prompt: str, *,
+                            context_date: str | None = None,
+                            date_recipe: str | None = None) -> str:
     """Hash a measured CLI prefix with exactly one user-task span replaced.
 
     This permits another trusted task without accepting added startup/local context.
@@ -170,6 +213,29 @@ def initial_template_sha256(messages: list[dict[str, Any]], prompt: str) -> str:
             message["content"] = replace(message.get("content"))
     if count != 1:
         raise RoutingError("the CLI prefix must contain the trusted task exactly once")
+    if date_recipe is not None:
+        if date_recipe != CLI_DATE_RECIPE or context_date is None:
+            raise RoutingError("the CLI prefix needs its signed native-date recipe")
+        users = [message for message in template if message["role"] == "user"]
+        content = users[0].get("content") if users else None
+        if (not isinstance(content, list) or len(content) != 2
+                or any(not isinstance(block, dict) or set(block) != {"type", "text"}
+                       or block["type"] != "text" for block in content)):
+            raise RoutingError("the native CLI initial user blocks changed")
+        content[0]["text"] = _canonical_date_block(
+            content[0]["text"], context_date, CLI_DATE_REMINDER_TEMPLATE_SHA256)
+
+        def has_date(value):
+            if isinstance(value, str):
+                return ISO_DATE.search(value) is not None
+            if isinstance(value, list):
+                return any(has_date(item) for item in value)
+            if isinstance(value, dict):
+                return any(has_date(item) for item in value.values())
+            return False
+
+        if has_date(template):
+            raise RoutingError("the CLI prefix contains another uncontrolled date")
     return hashlib.sha256(canonical_json(template)).hexdigest()
 
 
@@ -183,12 +249,14 @@ class SignedCLIToolBridge:
 
     def __init__(self, router: ToolRouter, capability: SignedCLICapability, *,
                  prompt: str,
-                 max_turns: int = MAX_CLI_TURNS) -> None:
+                 max_turns: int = MAX_CLI_TURNS, context_date: str | None = None) -> None:
         if not 1 <= max_turns <= MAX_CLI_TURNS:
             raise ValueError("CLI turns must be between 1 and 48")
         self.router = router
         self.capability = capability
         self.max_turns = max_turns
+        self.context_date = (require_context_date(context_date) if capability.date_recipe
+                             else context_date)
         self._turns: list[tuple[tuple[str, str, str], ...]] = []
         self._prompt = prompt
         self._history: list[dict[str, Any]] | None = None
@@ -272,7 +340,8 @@ class SignedCLIToolBridge:
         """
         normal = [self._normalise_message(message) for message in messages]
         if self._history is None:
-            if initial_template_sha256(normal, self._prompt) != self.capability.initial_template_sha256:
+            if initial_template_sha256(normal, self._prompt, context_date=self.context_date,
+                                       date_recipe=self.capability.date_recipe) != self.capability.initial_template_sha256:
                 raise RoutingError("the CLI initial prefix differs from its qualified task template")
             self._history = normal
         elif self._pending is not None or canonical_json(normal) != canonical_json(self._history):

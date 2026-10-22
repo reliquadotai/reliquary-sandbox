@@ -38,7 +38,7 @@ jobs:
       - name: Fetch the reviewed native model boundary
         run: |
           git clone --filter=blob:none --no-checkout https://github.com/reliquadotai/reliquary.git "$RUNNER_TEMP/native"
-          git -C "$RUNNER_TEMP/native" checkout --detach 6a7d4841af92f01bb6095fb835c344cd2eca5ec5
+          git -C "$RUNNER_TEMP/native" checkout --detach 5dde09c5b6118876524189e4992fc80e35e54e2d
       - name: Install the isolated signed-episode test daemon
         env:
           DOCKER_HOST: unix:///var/run/docker.sock

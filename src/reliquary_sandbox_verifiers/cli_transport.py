@@ -232,6 +232,7 @@ class SignedCLITransport:
                 else:
                     # ACP otherwise chooses its SDK's bundled native executable.
                     config.env["CLAUDE_CODE_EXECUTABLE"] = binary
+                    config.env["TZ"] = "UTC"
                     config.env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
                     config.env["CLAUDE_CODE_ATTRIBUTION_HEADER"] = "0"
                     config.session_meta["systemPrompt"] = CLI_SYSTEM_PROMPT

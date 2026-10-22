@@ -42,7 +42,8 @@ def capability():
         qualification_sha256="b" * 64,
         runner_argv=("/opt/signed-cli/runtime/bin/python", "/opt/signed-cli/acp-runner.py"),
         runner_sha256="c" * 64,
-        initial_template_sha256=initial_template_sha256(PREFIX, "the trusted task"))
+        initial_template_sha256=initial_template_sha256(PREFIX, "the trusted task"),
+        date_recipe=None)
 
 
 def test_fixed_prompt_identity_cannot_be_replaced_by_a_caller(capability):
@@ -191,6 +192,22 @@ async def test_acp_final_reply_must_be_the_final_sampled_non_tool_turn(capabilit
     bridge.require_final_reply("done")
     with pytest.raises(RoutingError):
         bridge.require_final_reply("done but rewritten")
+
+
+async def test_sampled_reasoning_survives_the_next_signed_tool_history(capability):
+    bridge, _ = make_bridge(capability)
+    assistant = message()
+    assistant["reasoning_content"] = "Synthetic reasoning fixture."
+    register(bridge, assistant=assistant)
+    await bridge.call("bash", {"command": "pwd"})
+    history = [*PREFIX, assistant,
+               {"role": "tool", "tool_call_id": "call0", "content": "signed output"}]
+    bridge.validate_messages(history)
+    for altered in (None, "changed synthetic reasoning"):
+        changed = copy.deepcopy(history)
+        changed[-2]["reasoning_content"] = altered
+        with pytest.raises(RoutingError):
+            bridge.validate_messages(changed)
 
 
 async def test_an_unsigned_router_refusal_never_becomes_an_mcp_result(capability):

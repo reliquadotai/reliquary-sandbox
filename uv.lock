@@ -2892,6 +2892,7 @@ service = [
     { name = "uvicorn", extra = ["standard"] },
 ]
 verifiers = [
+    { name = "uvicorn" },
     { name = "verifiers" },
 ]
 
@@ -2914,6 +2915,7 @@ requires-dist = [
     { name = "python-multipart", marker = "extra == 'service'", specifier = ">=0.0.20" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.13,<1" },
     { name = "tenacity", specifier = ">=8.0.0,<10" },
+    { name = "uvicorn", marker = "extra == 'verifiers'", specifier = ">=0.30,<1" },
     { name = "uvicorn", extras = ["standard"], marker = "extra == 'service'", specifier = ">=0.30,<1" },
     { name = "verifiers", marker = "extra == 'verifiers'", git = "https://github.com/PrimeIntellect-ai/verifiers.git?rev=b2e4e8157783b2c0dffc7821044c87f29f1c3ccf" },
 ]

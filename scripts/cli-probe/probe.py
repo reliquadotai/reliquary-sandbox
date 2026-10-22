@@ -11,17 +11,19 @@ import asyncio
 import contextlib
 import dataclasses
 import hashlib
+import inspect
 import json
 import logging
 import os
 import platform
 import re
 import secrets
-import time
 import traceback
-from datetime import datetime, timezone
+from datetime import date, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
+from reliquary.eval import model_wire
 from reliquary.eval.protocol import digest
 from reliquary.eval.signed_agentic import model_client
 from verifiers.v1.clients import Client, ModelContext
@@ -35,7 +37,6 @@ from verifiers.v1.trace import AgentInfo, Trace, TraceTask
 from verifiers.v1.types import Sampling
 
 from reliquary_sandbox.attest.canonical import canonical_json
-from reliquary_sandbox.episode_client import EpisodeClient
 from reliquary_sandbox.tool_routing import ToolRouter
 from reliquary_sandbox_service.episodes.local_gateway import (
     default_budgets,
@@ -43,6 +44,7 @@ from reliquary_sandbox_service.episodes.local_gateway import (
     serve_app,
 )
 from reliquary_sandbox_verifiers.cli import (
+    CLI_DATE_RECIPE,
     CLI_VERSIONS,
     MCP_TOOLS,
     CLIUnavailable,
@@ -50,7 +52,9 @@ from reliquary_sandbox_verifiers.cli import (
     SignedCLIToolBridge,
     SignedMCPApp,
     initial_template_sha256,
+    utc_context_date,
 )
+from reliquary_sandbox_verifiers.cli_runner import capability_sha256, run_cli_episode
 from reliquary_sandbox_verifiers.cli_transport import (
     ACP_RUNNER_SHA256,
     SignedCLITransport,
@@ -143,6 +147,11 @@ class ScriptedGenerator:
         self.total_turns = total_turns
 
     def render_messages(self, messages, **kwargs):
+        if kwargs.get("thinking") is not True:
+            raise AssertionError("the CPU fixture must exercise frozen thinking=true")
+        if self.calls and not any(message.get("reasoning_content") == "Synthetic CPU reasoning fixture."
+                                  for message in messages if message.get("role") == "assistant"):
+            raise AssertionError("the actual CLI did not preserve complete sampled reasoning")
         return [1, 2]
 
     def generate_turn(self, ids, **kwargs):
@@ -160,6 +169,8 @@ class ScriptedGenerator:
             message.update(content="", tool_calls=[{
                 "id": f"signed-call-{index}", "name": self.names[tool],
                 "arguments": canonical_json(arguments).decode()}])
+            if index == 0:
+                message["reasoning_content"] = "Synthetic CPU reasoning fixture."
         return {"token_ids": [10 + index], "message": message,
                 "finish_reason": "tool_calls" if index < len(steps) else "stop"}
 
@@ -178,7 +189,7 @@ def capability(args):
     return SignedCLICapability(args.protocol, args.image, canonical_json(tools), names,
                               artifacts, "0" * 64,
                               ("/opt/signed-cli/runtime/bin/python", "/opt/signed-cli/acp-runner.py"),
-                              ACP_RUNNER_SHA256, "0" * 64)
+                              ACP_RUNNER_SHA256, "0" * 64, CLI_DATE_RECIPE)
 
 
 @contextlib.asynccontextmanager
@@ -196,55 +207,57 @@ async def model_endpoint(client, model=MODEL):
 async def signed_acceptance(args, cap, gateway, turns, *, model=MODEL, prompt=PROMPT):
     token = gateway.issue(env="live-env", split="train", index=0, image=args.task_image,
                           budgets=default_budgets(wall_s=600, cpu_s=120, max_calls=64))
-    async with EpisodeClient(gateway.url) as client:
-        episode = await client.open(token)
+    generator = ScriptedGenerator(cap, turns)
+    args.native, args.generator = None, generator
+    repo, revision = model.rsplit("@", 1)
+
+    def make_model_client(bridge, effective_deadline):
+        args.native = model_client(generator, task={
+            "model": {"repo": repo, "revision": revision},
+            "protocol": {"max_turns": 48, "max_episode_tokens": 65536},
+            "thinking": True, "max_new_tokens": 512, "sampling": {}},
+            source={"tools_sha256": digest(cap.model_tools),
+                    "renderer_id": "renderers:qwen38@0.1.11"},
+            deadline=effective_deadline, seed=1, cli_bridge=bridge)
+        return CaptureFailure(args.native, args.out / "native-failure.private.json")
+
+    # Qualification-only scoped lookups: the real composer/transport run unchanged,
+    # and no candidate enters the persistent production capability registry.
+    with patch("reliquary_sandbox_verifiers.cli_runner.qualified_capability", return_value=cap), \
+         patch("reliquary_sandbox_verifiers.cli_transport.qualified_capability", return_value=cap):
+        result = await run_cli_episode(protocol_id=cap.protocol_id,
+            expected_capability_sha256=capability_sha256(cap), context_date=args.context_date,
+            gateway_url=gateway.url, token=token, model=model, prompt=prompt,
+            make_model_client=make_model_client, max_turns=48, max_episode_tokens=65536,
+            deadline=asyncio.get_running_loop().time() + 240)
+    native = args.native
+    if turns == 48:
+        dialect = (ResponsesDialect() if args.protocol == "signed-codex-cli-v1"
+                   else AnthropicDialect())
         try:
-            bridge = SignedCLIToolBridge(ToolRouter(episode, offered=("bash", "edit")),
-                                         cap, prompt=prompt)
-            generator = ScriptedGenerator(cap, turns)
-            repo, revision = model.rsplit("@", 1)
-            native = model_client(generator, task={
-                "model": {"repo": repo, "revision": revision},
-                "protocol": {"max_turns": 48, "max_episode_tokens": 65536},
-                "thinking": False, "max_new_tokens": 512, "sampling": {}},
-                source={"tools_sha256": digest(cap.model_tools),
-                        "renderer_id": "renderers:qwen38@0.1.11"},
-                deadline=time.monotonic() + 240, seed=1, cli_bridge=bridge)
-            args.native, args.generator = native, generator
-            with serve_app(SignedMCPApp(bridge, path := secrets.token_hex(24))) as mcp:
-                captured = CaptureFailure(native, args.out / "native-failure.private.json")
-                async with model_endpoint(captured, model) as (endpoint, secret):
-                    result = await ProbeTransport(cap).run(
-                        model=model, endpoint=endpoint, secret=secret,
-                        mcp_url=mcp + "/" + path, prompt=prompt, bridge=bridge,
-                        deadline=asyncio.get_running_loop().time() + 240)
-            if turns == 48:
-                dialect = (ResponsesDialect() if args.protocol == "signed-codex-cli-v1"
-                           else AnthropicDialect())
-                try:
-                    await native.get_response(dialect, {}, None)
-                except TimeoutError:
-                    pass
-                else:
-                    raise AssertionError("a 49th generation was not refused")
-                if generator.calls != 48:
-                    raise AssertionError("a 49th call reached the scripted generator")
-        finally:
-            final = await episode.finish()
-            transcript = (await episode.transcript())["transcript"]
-    verified = gateway.verify(transcript)
-    if (not verified.ok or final.record["body"].get("reward") != 1.0
-            or result.reply != "done" or native.turns != turns or native.tool_calls != turns - 1):
+            await native.get_response(dialect, {}, None)
+        except TimeoutError:
+            pass
+        else:
+            raise AssertionError("a 49th generation was not refused")
+        if generator.calls != 48:
+            raise AssertionError("a 49th call reached the scripted generator")
+    verified = gateway.verify(result.transcript)
+    if (not verified.ok or result.final["body"].get("reward") != 1.0 or result.error is not None
+            or result.refusals or native.finish_reason != "stop"
+            or native.turns != turns or native.tool_calls != turns - 1):
         raise ValueError("the actual CLI did not pass signed CPU acceptance")
-    (args.out / f"synthetic-signed-{turns}-turns.private.json").write_bytes(canonical_json(transcript))
+    (args.out / f"synthetic-signed-{turns}-turns.private.json").write_bytes(canonical_json(result.transcript))
     return {"signed_calls": turns - 1, "model_turns": turns, "verified_transcript": True,
-            "graded_reward": 1.0, "attempt_49_refused_before_generator": turns == 48}
+            "graded_reward": 1.0, "attempt_49_refused_before_generator": turns == 48,
+            "frozen_thinking": True, "nonempty_reasoning_history_roundtrip": True}
 
 
 async def discover(args, cap, *, model, prompt, filename):
     discovery = Discovery(model)
     args.discovery = discovery
-    dummy = SignedCLIToolBridge(ToolRouter(NoCalls()), cap, prompt=prompt)
+    dummy = SignedCLIToolBridge(ToolRouter(NoCalls()), cap, prompt=prompt,
+                                context_date=args.context_date)
     with serve_app(SignedMCPApp(dummy, path := secrets.token_hex(24))) as mcp:
         async with model_endpoint(discovery, model) as (endpoint, secret):
             task = asyncio.create_task(ProbeTransport(cap).run(
@@ -277,20 +290,29 @@ async def execute(args):
             or discovery.raw_tools_count != 2):
         raise ValueError("the actual CLI did not expose exactly the two signed MCP tools")
     cap = dataclasses.replace(cap, model_tools_json=canonical_json(discovery.tools),
-        initial_template_sha256=initial_template_sha256(discovery.messages, PROMPT))
+        initial_template_sha256=initial_template_sha256(discovery.messages, PROMPT,
+            context_date=args.context_date, date_recipe=cap.date_recipe))
     args.stage = "fresh-model-task-prefix-repeatability"
     alternate = await discover(args, cap, model=ALTERNATE_MODEL, prompt=ALTERNATE_PROMPT,
                                filename="synthetic-alternate-initial-request.private.json")
     cap.require_model_tools(alternate.tools)
     if (alternate.raw_tools_count != 2 or initial_template_sha256(
-            alternate.messages, ALTERNATE_PROMPT) != cap.initial_template_sha256):
+            alternate.messages, ALTERNATE_PROMPT, context_date=args.context_date,
+            date_recipe=cap.date_recipe) != cap.initial_template_sha256):
         raise ValueError("the actual CLI prefix or tools changed across model/task identities")
+    tomorrow = (date.fromisoformat(args.context_date) + timedelta(days=1)).isoformat()
+    controlled = json.loads(json.dumps(discovery.messages))
+    user = next(message for message in controlled if message["role"] == "user")
+    user["content"][0]["text"] = user["content"][0]["text"].replace(args.context_date, tomorrow)
+    if initial_template_sha256(controlled, PROMPT, context_date=tomorrow,
+                              date_recipe=cap.date_recipe) != cap.initial_template_sha256:
+        raise ValueError("the pinned native-date template is not stable across controlled dates")
     prefix = canonical_json(discovery.messages).decode().replace(PROMPT, "<signed-task-prompt>")
     portable = {"no_model_identity": MODEL not in prefix and ALTERNATE_MODEL not in prefix,
                 "no_kernel": platform.release() not in prefix,
                 "no_workspace_path": "/workspace" not in prefix,
-                "no_controller_date": datetime.now(timezone.utc).date().isoformat() not in prefix,
-                "no_iso_dates": re.search(r"\b\d{4}-\d{2}-\d{2}\b", prefix) is None}
+                "one_signed_context_date": prefix.count(args.context_date) == 1,
+                "one_iso_date": len(re.findall(r"\b\d{4}-\d{2}-\d{2}\b", prefix)) == 1}
     if not all(portable.values()):
         raise ValueError("the actual CLI retained default environment/model/date context")
     args.stage = "signed-real-workspace-acceptance"
@@ -317,6 +339,11 @@ async def execute(args):
             "model_tools_sha256": cap.model_tools_sha256,
             "model_tools_count": len(cap.model_tools),
             "prompt_recipe": cap.prompt_recipe, "system_prompt_sha256": cap.system_prompt_sha256,
+            "date_recipe": cap.date_recipe, "date_template_sha256": cap.date_template_sha256,
+            "context_date": args.context_date, "controlled_date_templates_equal": True,
+            "capability_sha256": capability_sha256(cap), "production_composer": "run_cli_episode",
+            "native_model_client_source_sha256": hashlib.sha256(inspect.getsource(model_client).encode()).hexdigest(),
+            "native_model_wire_source_sha256": hashlib.sha256(Path(inspect.getfile(model_wire)).read_bytes()).hexdigest(),
             "fresh_model_and_task_prefix_equal": True, "default_context_absence": portable,
             "initial_template_sha256": cap.initial_template_sha256,
             "smoke": smoke, "full_budget": full_budget,
@@ -332,6 +359,7 @@ def main():
     parser.add_argument("--busybox", default="/usr/bin/busybox")
     parser.add_argument("--pidfile", default="/run/reliquary-xfs-docker.pid")
     args = parser.parse_args()
+    args.context_date = utc_context_date()
     os.umask(0o077)
     if Path(__file__).resolve().parents[2] in args.out.resolve().parents:
         raise ValueError("probe evidence must be outside the repository")
