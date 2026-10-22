@@ -48,6 +48,9 @@ jobs:
           sudo ./scripts/bootstrap-runtime.sh --configure-docker
           sudo ./scripts/test-xfs-docker.sh up
       - name: Build the prepared CLI fixture from immutable base digests
+        timeout-minutes: 12
+        env:
+          DOCKER_HOST: unix:///var/run/docker.sock
         run: |
           docker pull node:22.19.0-bookworm-slim
           docker pull python:3.12.13-slim-bookworm
@@ -62,13 +65,31 @@ jobs:
           assert hashlib.sha256(ACP_SOURCE.encode()).hexdigest() == "68fef2c97303a759e453e2f6d014aa730a91a3d60484d9e933cbbf7567c5a42c"
           (root / "acp-runner.py").write_text(ACP_SOURCE)
           def digest(image):
-              return subprocess.check_output(["docker", "inspect", "--format", "{{index .RepoDigests 0}}", image], text=True).strip()
+              return subprocess.check_output(["docker", "inspect", "--format", "{{index .RepoDigests 0}}", image], text=True, timeout=15).strip()
           subprocess.run(["docker", "build", "--build-arg", "NODE_BASE=" + digest("node:22.19.0-bookworm-slim"),
                           "--build-arg", "PYTHON_BASE=" + digest("python:3.12.13-slim-bookworm"),
-                          "--iidfile", str(root / "image-id"), str(root)], check=True)
+                          "--iidfile", str(root / "image-id"), str(root)], check=True, timeout=600)
+          image = (root / "image-id").read_text().strip()
+          target = "unix:///run/reliquary-xfs-docker.sock"
+          # The isolated test bridge deliberately has no Internet NAT. Build on
+          # the ordinary CI daemon, then move exact bytes through a pipe only.
+          saved = subprocess.Popen(["docker", "save", image], stdout=subprocess.PIPE)
+          try:
+              subprocess.run(["docker", "--host", target, "load"], stdin=saved.stdout,
+                             check=True, timeout=120)
+              saved.stdout.close()
+              assert saved.wait(timeout=15) == 0
+          finally:
+              if saved.poll() is None:
+                  saved.kill()
+                  saved.wait(timeout=5)
+          loaded = subprocess.check_output(["docker", "--host", target, "inspect", "--format", "{{.Id}}", image], text=True, timeout=15).strip()
+          assert loaded == image
+          task_image = digest("ubuntu:22.04")
+          subprocess.run(["docker", "--host", target, "pull", task_image], check=True, timeout=120)
           with open(os.environ["GITHUB_ENV"], "a") as out:
-              out.write("CLI_PROBE_IMAGE=" + (root / "image-id").read_text().strip() + "\n")
-              out.write("CLI_PROBE_TASK_IMAGE=" + digest("ubuntu:22.04") + "\n")
+              out.write("CLI_PROBE_IMAGE=" + image + "\n")
+              out.write("CLI_PROBE_TASK_IMAGE=" + task_image + "\n")
           PY
         shell: bash
       - name: Exercise actual pinned CLI processes through signed tools
