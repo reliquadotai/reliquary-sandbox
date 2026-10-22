@@ -149,7 +149,7 @@ async def test_mcp_endpoint_requires_secret_path_and_exact_registered_call(capab
                                 base_url="http://test") as client:
         request = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
         assert (await client.post("/wrong", json=request)).status_code == 404
-        assert (await client.get("/" + "a" * 32)).status_code == 404
+        assert (await client.get("/" + "a" * 32)).status_code == 405
         response = await client.post("/" + "a" * 32, json=request)
         assert response.json()["result"]["tools"] == list(MCP_TOOLS)
         request.update(method="tools/call", params={"name": "bash", "arguments": {"command": "pwd"}})

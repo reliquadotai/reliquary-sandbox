@@ -84,6 +84,22 @@ jobs:
             fi
           done
           exit "${status:-0}"
+      - name: Encrypt the exact tested runtime for private retention
+        id: retain
+        if: always() && env.CLI_PROBE_IMAGE != ''
+        timeout-minutes: 3
+        run: timeout --signal=TERM --kill-after=10s 120s bash scripts/cli-probe/retain-image.sh "$CLI_PROBE_IMAGE" "$RUNNER_TEMP/runtime-retention"
+      - name: Retain only encrypted runtime bytes and safe integrity metadata
+        if: always() && steps.retain.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: encrypted-cli-runtime
+          retention-days: 1
+          compression-level: 0
+          path: |
+            ${{ runner.temp }}/runtime-retention/runtime.cms
+            ${{ runner.temp }}/runtime-retention/summary.json
+          if-no-files-found: error
       - name: Report sanitized acceptance only
         if: always()
         run: |

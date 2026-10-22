@@ -313,9 +313,10 @@ class SignedMCPApp:
         if scope["type"] != "http":
             raise ValueError("the signed MCP endpoint supports HTTP only")
         status, result = 200, None
-        if (scope["method"] != "POST"
-                or not hmac.compare_digest(scope.get("path", ""), self._path)):
+        if not hmac.compare_digest(scope.get("path", ""), self._path):
             status, result = 404, {"error": "not found"}
+        elif scope["method"] != "POST":
+            status, result = 405, {"error": "method not allowed"}
         else:
             raw = bytearray()
             while True:
