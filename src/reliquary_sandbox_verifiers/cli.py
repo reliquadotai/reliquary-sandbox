@@ -282,6 +282,9 @@ class SignedCLIToolBridge:
         normal = copy.deepcopy(message)
         if not isinstance(normal, dict):
             raise RoutingError("a CLI message must be an object")
+        # Both pinned CLI dialect parsers fold absent tool-call text to None.
+        if normal.get("role") == "assistant" and normal.get("tool_calls") and normal.get("content") == "":
+            normal["content"] = None
         for call in normal.get("tool_calls") or []:
             try:
                 function = call["function"]

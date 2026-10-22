@@ -107,6 +107,9 @@ async def test_only_the_sampled_call_gets_one_signed_observation(capability):
     history = [*PREFIX, assistant,
                {"role": "tool", "tool_call_id": "call0", "content": "signed output"}]
     bridge.validate_messages(history)
+    folded = copy.deepcopy(history)
+    folded[-2]["content"] = None
+    bridge.validate_messages(folded)
     for alter in (lambda h: h[-1].update(content="unsigned"),
                   lambda h: h[-2].update(content="changed assistant"),
                   lambda h: h.append({"role": "user", "content": "local tool output"}),

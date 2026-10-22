@@ -12,7 +12,7 @@ fingerprint=$(openssl x509 -in "$cert" -noout -fingerprint -sha256)
 fingerprint=${fingerprint#*=}
 fingerprint=${fingerprint//:/}
 [[ "$fingerprint" == C8C959D5DD13314320C084011D04DB576543BBE000D0CC5C778B89A202EFC689 ]]
-# Non-streaming GCM buffers input: cap image size before export, after probes stop.
+# Cap image size before export, after all probe containers have stopped.
 image_bytes=$(docker inspect --format '{{.Size}}' "$image")
 [[ "$image_bytes" =~ ^[0-9]+$ ]]
 (( image_bytes < 1024 * 1024 * 1024 - 16 * 1024 * 1024 ))
@@ -27,12 +27,18 @@ cleanup() {
   rm -f "$fifo"
 }
 trap cleanup EXIT
+# Exercise the actual pipe-to-file streaming path before exporting large bytes.
+python3 -c 'import sys; sys.stdout.buffer.write(b"x" * 131072)' | \
+  timeout --signal=TERM --kill-after=2s 15s openssl cms -encrypt -aes-256-gcm -stream \
+    -binary -outform DER -recip "$cert" -out "$out/pipe-fixture.cms"
+[[ -s "$out/pipe-fixture.cms" ]]
+rm -f "$out/pipe-fixture.cms"
 sha256sum < "$fifo" > "$out/archive.sha256" &
 hasher=$!
 # GNU bash uses KiB for this bound; stat below independently rejects oversized output.
 ulimit -f 2097152
 docker save "$image" | tee "$fifo" | \
-  openssl cms -encrypt -aes-256-gcm -binary -outform DER -recip "$cert" \
+  openssl cms -encrypt -aes-256-gcm -stream -binary -outform DER -recip "$cert" \
     -out "$out/runtime.cms"
 wait "$hasher"
 hasher=
@@ -49,6 +55,7 @@ summary = {"image_id": image, "archive_sha256": (root / "archive.sha256").read_t
            "ciphertext_sha256": (root / "cipher.sha256").read_text().split()[0],
            "ciphertext_bytes": (root / "runtime.cms").stat().st_size,
            "maximum_image_bytes": 1024 * 1024 * 1024 - 16 * 1024 * 1024,
+           "pipe_fixture_bytes": 131072,
            "recipient_certificate_sha256": fingerprint,
            "encryption": "OpenSSL CMS AES-256-GCM; recipient private key never present on CI"}
 (root / "summary.json").write_text(json.dumps(summary, sort_keys=True) + "\n")
