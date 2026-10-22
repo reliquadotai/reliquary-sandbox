@@ -15,6 +15,7 @@ fingerprint=${fingerprint//:/}
 # Cap image size before export, after all probe containers have stopped.
 image_bytes=$(docker inspect --format '{{.Size}}' "$image")
 [[ "$image_bytes" =~ ^[0-9]+$ ]]
+printf 'Retention image bytes: %s\n' "$image_bytes"
 (( image_bytes < 1024 * 1024 * 1024 - 16 * 1024 * 1024 ))
 fifo="$out/archive-hash.fifo"
 mkfifo -m 600 "$fifo"

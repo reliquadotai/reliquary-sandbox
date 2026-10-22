@@ -16,6 +16,7 @@ import logging
 import os
 import secrets
 import time
+import traceback
 from pathlib import Path
 
 from reliquary.eval.protocol import digest
@@ -292,8 +293,11 @@ def main():
     try:
         summary = asyncio.run(asyncio.wait_for(execute(args), timeout=600))
     except Exception as error:
+        site = traceback.extract_tb(error.__traceback__)[-1]
         summary = {"status": "failed", "protocol_id": args.protocol, "approved": False,
                    "exception_class": type(error).__name__,
+                   "failure_site": {"module": Path(site.filename).name,
+                                    "line": site.lineno, "function": site.name},
                    "stage": getattr(args, "stage", "preflight"),
                    "detail": "actual CLI CPU probe failed; raw synthetic evidence retained privately"}
     (args.out / "summary.json").write_bytes(canonical_json(summary) + b"\n")

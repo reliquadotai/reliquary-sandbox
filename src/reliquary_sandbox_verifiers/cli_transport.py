@@ -166,7 +166,9 @@ class SignedCLITransport:
             if (parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost"}
                     or parsed.username or parsed.password or parsed.query or parsed.fragment):
                 raise ValueError("CLI model and MCP endpoints must be local HTTP services")
-        if not isinstance(secret, str) or len(secret) < 32 or not model or not prompt:
+        # The pinned interception server mints token_urlsafe(16): 128 bits, 22 chars.
+        if (not isinstance(secret, str) or not re.fullmatch(r"[A-Za-z0-9_-]{22,}", secret)
+                or not model or not prompt):
             raise ValueError("the CLI needs a model, prompt and fresh per-run proxy secret")
         runtime = self.runtime_factory(cap)
         require_isolated_runtime(runtime, cap)
