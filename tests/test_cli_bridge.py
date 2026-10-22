@@ -92,7 +92,10 @@ def register(bridge, turn=0, assistant=None):
     return assistant
 
 
-def test_no_actual_cli_is_enabled_without_a_reviewed_probe():
+def test_no_actual_cli_is_enabled_without_a_reviewed_probe(monkeypatch):
+    from reliquary_sandbox_verifiers import cli
+
+    monkeypatch.setattr(cli, "_QUALIFIED", {})
     for protocol in ("signed-codex-cli-v1", "signed-claude-code-cli-v1", "bash"):
         with pytest.raises(CLIUnavailable, match="no approved"):
             qualified_capability(protocol)

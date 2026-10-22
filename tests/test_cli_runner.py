@@ -83,7 +83,7 @@ def composition(monkeypatch, capability):
         state.bridge, state.effective_deadline = bridge, deadline
         return SimpleNamespace()
 
-    monkeypatch.setitem(cli._QUALIFIED, capability.protocol_id, capability)
+    monkeypatch.setattr(cli, "_QUALIFIED", {capability.protocol_id: capability})
     monkeypatch.setattr(runner, "EpisodeClient", Gateway)
     monkeypatch.setattr(runner, "SignedCLITransport", Transport)
     monkeypatch.setattr(runner, "_mcp_endpoint", mcp)

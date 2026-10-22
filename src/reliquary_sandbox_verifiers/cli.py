@@ -12,8 +12,10 @@ import hashlib
 import hmac
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from datetime import date, datetime, timezone
+from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from reliquary_sandbox.attest.canonical import canonical_json
@@ -135,9 +137,43 @@ class SignedCLICapability:
             raise RoutingError("the CLI offered tools outside its qualified MCP-only schema")
 
 
-# Populated only after reviewing a real pinned-CLI CPU probe. A caller-provided
-# receipt or a boolean is not authority to add a production capability.
-_QUALIFIED: dict[str, SignedCLICapability] = {}
+_CAPABILITY_RESOURCE_SHA256 = "748cb39764e33d9bb35842bfc441a64c53c631822026da53ac7e1a9cf075757b"
+
+
+def _load_qualified_capability() -> SignedCLICapability:
+    """Load only the source-reviewed CPU mediation identity shipped in this package."""
+    try:
+        raw = Path(__file__).with_name("signed_cli_capability.json").read_bytes()
+        if hashlib.sha256(raw).hexdigest() != _CAPABILITY_RESOURCE_SHA256:
+            raise ValueError("the packaged CLI capability digest differs")
+        identity = json.loads(raw)
+        names = {field.name for field in fields(SignedCLICapability)} - {"model_tools_json"}
+        derived = {"schema", "versions", "date_template_sha256", "max_turns"}
+        if (not isinstance(identity, dict) or set(identity) != names | derived | {"model_tools"}
+                or canonical_json(identity) != raw):
+            raise ValueError("the packaged CLI capability shape differs")
+        values = {name: identity[name] for name in names}
+        values["model_tools_json"] = canonical_json(identity["model_tools"])
+        values["runner_argv"] = tuple(values["runner_argv"])
+        for name in ("model_tool_names", "artifacts"):
+            values[name] = tuple(tuple(row) for row in values[name])
+        capability = SignedCLICapability(**values)
+        if (capability.protocol_id != "signed-claude-code-cli-v1"
+                or capability.date_recipe != CLI_DATE_RECIPE
+                or capability.qualification_sha256 == "0" * 64
+                or identity["schema"] != "reliquary/signed-cli-capability/v1"
+                or identity["versions"] != list(capability.versions)
+                or identity["date_template_sha256"] != capability.date_template_sha256
+                or identity["max_turns"] != MAX_CLI_TURNS):
+            raise ValueError("the packaged CLI capability derived identity differs")
+        return capability
+    except (OSError, KeyError, TypeError, ValueError):
+        raise CLIUnavailable("the packaged CPU CLI capability could not be verified") from None
+
+
+# Source-owned qualification is CPU tool mediation only. Caller configuration,
+# receipts and booleans cannot add a capability or authorize a placement.
+_QUALIFIED = MappingProxyType({"signed-claude-code-cli-v1": _load_qualified_capability()})
 
 
 def qualified_capability(protocol_id: str) -> SignedCLICapability:
