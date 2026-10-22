@@ -128,6 +128,11 @@ async def _cleanup(runtime: Runtime, process: RuntimeProcess | None,
             with contextlib.suppress(BaseException):
                 await stderr_task
         await runtime.stop()
+        listing = await asyncio.wait_for(docker(
+            "ps", "-a", "--filter", "name=^/" + runtime.name + "$",
+            "--format", "{{.Names}}"), timeout=10)
+        if listing.exit_code or listing.stdout.strip():
+            raise CLIUnavailable("the CLI container removal could not be verified")
 
 
 @dataclass(frozen=True)

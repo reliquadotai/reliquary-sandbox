@@ -10,7 +10,8 @@ COPY package.json package-lock.json ./
 RUN npm ci --ignore-scripts --no-audit --no-fund --omit=dev && \
     node -e 'if (!process.report.getReport().header.glibcVersionRuntime || process.arch !== "x64") process.exit(1)' && \
     rm -rf node_modules/@anthropic-ai/claude-code-linux-x64-musl \
-      node_modules/@anthropic-ai/claude-agent-sdk-linux-x64-musl && \
+      node_modules/@anthropic-ai/claude-agent-sdk-linux-x64-musl \
+      node_modules/@anthropic-ai/claude-agent-sdk-linux-x64 && \
     npm cache clean --force
 COPY requirements.txt /opt/signed-cli/requirements.txt
 RUN python -m venv /opt/signed-cli/runtime && \

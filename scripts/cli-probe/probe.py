@@ -27,7 +27,6 @@ from verifiers.v1.configs.agent import AgentConfig
 from verifiers.v1.configs.client import EvalClientConfig
 from verifiers.v1.dialects import AnthropicDialect, ResponsesDialect
 from verifiers.v1.interception import InterceptionServer
-from verifiers.v1.runtimes.docker import docker
 from verifiers.v1.session import RolloutSession
 from verifiers.v1.trace import AgentInfo, Trace, TraceTask
 from verifiers.v1.types import Sampling
@@ -59,37 +58,16 @@ PROMPT = "Use the signed workspace tools to write 41, edit it to 42, read it, th
 MODEL = "fixture/signed-cli@" + "a" * 40
 
 
-class CleanupFailure(Exception):
-    pass
-
-
 class ProbeTransport(SignedCLITransport):
     """Explicit unapproved CPU probe; never used by the normal protocol lookup."""
 
     def __init__(self, capability):
         self.capability = capability
-        self.owned = None
-
-        def factory(cap):
-            self.owned = docker_runtime(cap)
-            return self.owned
-
-        self.runtime_factory = factory
+        self.runtime_factory = docker_runtime
 
     def _require_approved(self, bridge):
         if bridge.capability != self.capability:
             raise ValueError("probe capability changed")
-
-    async def run(self, **kwargs):
-        try:
-            return await super().run(**kwargs)
-        finally:
-            if self.owned is not None:
-                listing = await asyncio.wait_for(docker(
-                    "ps", "-a", "--filter", "name=^/" + self.owned.name + "$",
-                    "--format", "{{.Names}}"), timeout=10)
-                if listing.exit_code or listing.stdout.strip():
-                    raise CleanupFailure("the CPU probe could not verify its CLI container removal")
 
 
 class NoCalls:
@@ -120,6 +98,32 @@ class Discovery(Client):
         if route != "/v1/messages/count_tokens":
             raise ValueError("unsupported discovery auxiliary route")
         return {"input_tokens": 1}
+
+
+class CaptureFailure(Client):
+    """Retain a failed synthetic request privately without changing native behavior."""
+
+    def __init__(self, client, path):
+        self.client, self.path = client, path
+
+    async def _capture(self, body, operation):
+        try:
+            return await operation
+        except Exception:
+            if not self.path.exists():
+                data = canonical_json({"body": body, "traceback": traceback.format_exc()})
+                if len(data) <= 2 * 1024 * 1024:
+                    self.path.write_bytes(data)
+            raise
+
+    async def get_response(self, dialect, body, sampling, **kwargs):
+        return await self._capture(body, self.client.get_response(dialect, body, sampling, **kwargs))
+
+    async def relay(self, dialect, body, **kwargs):
+        return await self._capture(body, self.client.relay(dialect, body, **kwargs))
+
+    async def relay_aux(self, dialect, route, body, **kwargs):
+        return await self._capture(body, self.client.relay_aux(dialect, route, body, **kwargs))
 
 
 class ScriptedGenerator:
@@ -197,8 +201,10 @@ async def signed_acceptance(args, cap, gateway, turns):
                 source={"tools_sha256": digest(cap.model_tools),
                         "renderer_id": "renderers:qwen38@0.1.11"},
                 deadline=time.monotonic() + 240, seed=1, cli_bridge=bridge)
+            args.native, args.generator = native, generator
             with serve_app(SignedMCPApp(bridge, path := secrets.token_hex(24))) as mcp:
-                async with model_endpoint(native) as (endpoint, secret):
+                captured = CaptureFailure(native, args.out / "native-failure.private.json")
+                async with model_endpoint(captured) as (endpoint, secret):
                     result = await ProbeTransport(cap).run(
                         model=MODEL, endpoint=endpoint, secret=secret,
                         mcp_url=mcp + "/" + path, prompt=PROMPT, bridge=bridge,
@@ -273,6 +279,10 @@ async def execute(args):
             "cli_and_acp": CLI_VERSIONS[args.protocol], "runtime_image": args.image,
             "artifact_lock_sha256": hashlib.sha256(
                 (Path(__file__).parent / "package-lock.json").read_bytes()).hexdigest(),
+            "artifact_lock_scope": "all optional platforms; image uses Linux x64 glibc",
+            "excluded_unused_optionals": ["@anthropic-ai/claude-code-linux-x64-musl",
+                "@anthropic-ai/claude-agent-sdk-linux-x64-musl",
+                "@anthropic-ai/claude-agent-sdk-linux-x64"],
             "model_tools_sha256": cap.model_tools_sha256,
             "model_tools_count": len(cap.model_tools),
             "initial_template_sha256": cap.initial_template_sha256,
@@ -330,6 +340,9 @@ def main():
                     "function", "custom", "namespace"} else "other"
                     for tool in discovery.raw_tools}),
                 "sha256": hashlib.sha256(canonical_json(discovery.raw_tools)).hexdigest()}
+        if getattr(args, "native", None) is not None:
+            summary["scripted_generator_calls"] = args.generator.calls
+            summary["native_model_turns"] = args.native.turns
     (args.out / "summary.json").write_bytes(canonical_json(summary) + b"\n")
     print(json.dumps({key: summary[key] for key in ("status", "protocol_id", "approved")}))
     return 0 if summary["status"] == "passed" else 1
