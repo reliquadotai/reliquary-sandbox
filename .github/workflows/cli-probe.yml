@@ -105,6 +105,34 @@ jobs:
             fi
           done
           exit "${status:-0}"
+      - name: Encrypt private synthetic probe evidence for local review
+        id: evidence
+        if: always()
+        timeout-minutes: 1
+        run: |
+          umask 077
+          ulimit -f 16384
+          python - <<'PY' | timeout --signal=TERM --kill-after=2s 20s openssl cms -encrypt -aes-256-gcm -stream -binary -outform DER -recip scripts/cli-probe/recipient.crt -out "$RUNNER_TEMP/probe-evidence.cms"
+          import json, os, pathlib, sys
+          root = pathlib.Path(os.environ["RUNNER_TEMP"])
+          evidence = {}
+          for protocol in ("signed-codex-cli-v1", "signed-claude-code-cli-v1"):
+              for name in ("synthetic-initial-request.private.json", "failure.private.json"):
+                  path = root / protocol / name
+                  if path.exists():
+                      assert path.stat().st_size <= 2 * 1024 * 1024
+                      evidence[protocol + "/" + name] = json.loads(path.read_text())
+          json.dump(evidence, sys.stdout)
+          PY
+      - name: Retain only recipient-encrypted synthetic evidence
+        if: always() && steps.evidence.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: encrypted-cli-probe-evidence
+          retention-days: 1
+          compression-level: 0
+          path: ${{ runner.temp }}/probe-evidence.cms
+          if-no-files-found: error
       - name: Encrypt the exact tested runtime for private retention
         id: retain
         if: always() && env.CLI_PROBE_IMAGE != ''

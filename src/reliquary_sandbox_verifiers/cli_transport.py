@@ -191,7 +191,8 @@ class SignedCLITransport:
                     raise CLIUnavailable("the actual CLI runtime must run as its dedicated nonroot user")
                 cli = cap.protocol_id == "signed-codex-cli-v1"
                 binary = ("/opt/signed-cli/node/node_modules/.bin/codex" if cli
-                          else "/opt/signed-cli/node/node_modules/.bin/claude")
+                          else "/opt/signed-cli/node/node_modules/"
+                               "@anthropic-ai/claude-code-linux-x64/claude")
                 version = await runtime.run([binary, "--version"], {})
                 if version.exit_code or not re.search(
                         r"(?:^|\s)" + re.escape(cap.versions[1]) + r"(?:\s|$)", version.stdout):
@@ -218,6 +219,8 @@ class SignedCLITransport:
                     settings["web_search"] = "disabled"
                     config.env["CODEX_CONFIG"] = json.dumps(settings)
                 else:
+                    # ACP otherwise chooses its SDK's bundled native executable.
+                    config.env["CLAUDE_CODE_EXECUTABLE"] = binary
                     config.session_meta["claudeCode"]["options"]["tools"] = []
                     config.session_meta["claudeCode"]["options"]["settingSources"] = []
                 process = await runtime.open_process(list(cap.runner_argv), config.env)

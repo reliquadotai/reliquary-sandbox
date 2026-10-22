@@ -43,6 +43,7 @@ from reliquary_sandbox_service.episodes.local_gateway import (
 from reliquary_sandbox_verifiers.cli import (
     CLI_VERSIONS,
     MCP_TOOLS,
+    CLIUnavailable,
     SignedCLICapability,
     SignedCLIToolBridge,
     SignedMCPApp,
@@ -101,12 +102,14 @@ class Discovery(Client):
         self.found = asyncio.Event()
         self.messages, self.tools = None, None
         self.raw_tools_count = 0
+        self.raw_tools = []
 
     async def get_response(self, dialect, body, sampling, **kwargs):
+        self.raw_tools = body.get("tools") or []
+        self.raw_tools_count = len(self.raw_tools)
         request = dialect.parse_request(body)
         self.messages = [message_to_wire(message) for message in request.messages]
         self.tools = [tool_to_wire(tool) for tool in request.tools or []]
-        self.raw_tools_count = len(body.get("tools") or [])
         self.found.set()
         raise ValueError("CPU schema discovery stops before model generation")
 
@@ -227,6 +230,7 @@ async def execute(args):
     args.stage = "schema-discovery"
     cap = capability(args)
     discovery = Discovery()
+    args.discovery = discovery
     dummy = SignedCLIToolBridge(ToolRouter(NoCalls()), cap, prompt=PROMPT)
     with serve_app(SignedMCPApp(dummy, path := secrets.token_hex(24))) as mcp:
         async with model_endpoint(discovery) as (endpoint, secret):
@@ -245,7 +249,7 @@ async def execute(args):
                     await task
                 found.cancel()
     (args.out / "synthetic-initial-request.private.json").write_bytes(canonical_json({
-        "messages": discovery.messages, "tools": discovery.tools}))
+        "messages": discovery.messages, "tools": discovery.tools, "raw_tools": discovery.raw_tools}))
     names = {tool["function"]["name"] for tool in discovery.tools}
     args.stage = "exact-mcp-schema-check"
     if (names != {name for name, _ in cap.model_tool_names} or len(discovery.tools) != 2
@@ -269,7 +273,8 @@ async def execute(args):
             "cli_and_acp": CLI_VERSIONS[args.protocol], "runtime_image": args.image,
             "artifact_lock_sha256": hashlib.sha256(
                 (Path(__file__).parent / "package-lock.json").read_bytes()).hexdigest(),
-            "model_tools": cap.model_tools, "model_tools_sha256": cap.model_tools_sha256,
+            "model_tools_sha256": cap.model_tools_sha256,
+            "model_tools_count": len(cap.model_tools),
             "initial_template_sha256": cap.initial_template_sha256,
             "smoke": smoke, "full_budget": full_budget,
             "process_cleanup": "owned CLI containers verified absent"}
@@ -293,6 +298,11 @@ def main():
     try:
         summary = asyncio.run(asyncio.wait_for(execute(args), timeout=600))
     except Exception as error:
+        (args.out / "failure.private.json").write_bytes(canonical_json({
+            "traceback": traceback.format_exc(),
+            "messages": getattr(getattr(args, "discovery", None), "messages", None),
+            "tools": getattr(getattr(args, "discovery", None), "tools", None),
+            "raw_tools": getattr(getattr(args, "discovery", None), "raw_tools", None)}))
         site = traceback.extract_tb(error.__traceback__)[-1]
         summary = {"status": "failed", "protocol_id": args.protocol, "approved": False,
                    "exception_class": type(error).__name__,
@@ -300,6 +310,26 @@ def main():
                                     "line": site.lineno, "function": site.name},
                    "stage": getattr(args, "stage", "preflight"),
                    "detail": "actual CLI CPU probe failed; raw synthetic evidence retained privately"}
+        if isinstance(error, CLIUnavailable):
+            summary["preflight_reason"] = {
+                "the CLI runtime PID bound could not be installed": "pid_bound",
+                "the prepared image has a different ACP runner": "runner_hash",
+                "the actual CLI runtime must run as its dedicated nonroot user": "nonroot_uid",
+                "the prepared image contains another CLI binary version": "binary_version",
+            }.get(str(error), "other_capability_gate")
+        if getattr(args, "discovery", None) is not None:
+            discovery = args.discovery
+            expected = {"mcp__signed_episode__bash", "mcp__signed_episode__edit"}
+            names = {tool.get("function", {}).get("name") for tool in discovery.tools or []}
+            summary["offered_tools"] = {
+                "raw_count": discovery.raw_tools_count,
+                "parsed_count": len(discovery.tools or []),
+                "expected_mcp_names_match": names == expected,
+                "expected_mcp_names_present": len(names & expected),
+                "raw_types": sorted({tool.get("type") if tool.get("type") in {
+                    "function", "custom", "namespace"} else "other"
+                    for tool in discovery.raw_tools}),
+                "sha256": hashlib.sha256(canonical_json(discovery.raw_tools)).hexdigest()}
     (args.out / "summary.json").write_bytes(canonical_json(summary) + b"\n")
     print(json.dumps({key: summary[key] for key in ("status", "protocol_id", "approved")}))
     return 0 if summary["status"] == "passed" else 1

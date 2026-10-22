@@ -7,7 +7,11 @@ COPY --from=node /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
 RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm
 WORKDIR /opt/signed-cli/node
 COPY package.json package-lock.json ./
-RUN npm ci --ignore-scripts --no-audit --no-fund --omit=dev && npm cache clean --force
+RUN npm ci --ignore-scripts --no-audit --no-fund --omit=dev && \
+    node -e 'if (!process.report.getReport().header.glibcVersionRuntime || process.arch !== "x64") process.exit(1)' && \
+    rm -rf node_modules/@anthropic-ai/claude-code-linux-x64-musl \
+      node_modules/@anthropic-ai/claude-agent-sdk-linux-x64-musl && \
+    npm cache clean --force
 COPY requirements.txt /opt/signed-cli/requirements.txt
 RUN python -m venv /opt/signed-cli/runtime && \
     /opt/signed-cli/runtime/bin/python -m pip install --no-cache-dir --only-binary=:all: \
