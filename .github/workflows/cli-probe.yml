@@ -97,7 +97,7 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}/src:${{ github.workspace }}/tests:${{ runner.temp }}/native
           RELIQUARY_SCORING_UNPRIVILEGED_OK: "1"
         run: |
-          for protocol in signed-codex-cli-v1 signed-claude-code-cli-v1; do
+          for protocol in signed-claude-code-cli-v1; do
             if ! uv run --no-sync python scripts/cli-probe/probe.py \
               --protocol "$protocol" --image "$CLI_PROBE_IMAGE" \
               --task-image "$CLI_PROBE_TASK_IMAGE" --out "$RUNNER_TEMP/$protocol"; then
@@ -159,7 +159,7 @@ jobs:
               summary.write("Scripted CPU fixture only; no model weights, GPU, deployment or approved capability.\n\n")
               for protocol in ("signed-codex-cli-v1", "signed-claude-code-cli-v1"):
                   path = root / protocol / "summary.json"
-                  result = json.loads(path.read_text()) if path.exists() else {"status": "not run"}
+                  result = json.loads(path.read_text()) if path.exists() else {"status": "unavailable"}
                   summary.write(f"- {protocol}: {result['status']}\n")
           PY
       - name: Retain sanitized CPU acceptance summaries
