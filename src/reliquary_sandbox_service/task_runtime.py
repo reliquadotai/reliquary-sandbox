@@ -1,5 +1,5 @@
 """Task images as-is under gVisor: writable root capped by an xfs project quota,
-network none, per-call timeouts that kill only the command's process group.
+network none (or, for a task with controlled egress, only the egress network), per-call timeouts that kill only the command's process group.
 
 Separate from `DockerRuntime`, whose guests are read-only, uid-1000 and
 Python-based. Boxes carry their own ownership label, so the tenant
@@ -437,6 +437,8 @@ def _scrub(data: bytes) -> bytes:
     return re.sub(rb"[^\n]*(?:OCI runtime|urpc method|containerManager\.)[^\n]*", SCRUBBED, data)
 
 
+SERVICE_PIDS = 256
+SERVICE_DISK_BYTES = 2 * 1024**3
 _BOX_HOSTNAME = "sandbox"
 _ETC_FILES = {
     "/etc/hosts": f"127.0.0.1 localhost\n::1 localhost ip6-localhost ip6-loopback\n"
@@ -457,6 +459,10 @@ class BoxSpec:
     pids: int
     disk_bytes: int
     lifetime_s: int
+    network: str | None = None
+    """The egress network (settings.episode_egress_network) for an online box; None = offline."""
+    services: tuple[Any, ...] = ()
+    """The task's sidecars (episode_task.TaskService), made with this box on a private network."""
 
 
 @dataclass(frozen=True)
@@ -606,6 +612,7 @@ class TaskBoxRuntime:
         if self._daemon_started_at() is None:
             raise InfraUnavailable("The Docker daemon start time is unreadable "
                                    "(episode_docker_pidfile and /proc must be visible)")
+        self.check_egress_network()
         present = self.images_present()
         if not present:
             raise InfraUnavailable("No approved episode image is present locally")
@@ -734,14 +741,18 @@ class TaskBoxRuntime:
     def _etc_dir(self, box_id: str) -> Path:
         return Path(self.settings.state_dir) / "episode-etc" / self._name(box_id)
 
-    def _etc_mounts(self, box_id: str) -> list[Any]:
+    def _etc_mounts(self, box_id: str, hosts: dict[str, str] | None = None) -> list[Any]:
         """Read-only controller-owned /etc/{hosts,hostname,resolv.conf}: Docker
         would otherwise bind-mount writable copies from outside the box's disk
-        quota, an unmetered place for the agent to write."""
+        quota, an unmetered place for the agent to write. A box's sidecars are
+        listed in its /etc/hosts (name -> address on their private network)."""
         directory = self._etc_dir(box_id)
         directory.mkdir(parents=True, exist_ok=True, mode=0o755)
         mounts = []
-        for target, content in _ETC_FILES.items():
+        files = dict(_ETC_FILES)
+        if hosts:
+            files["/etc/hosts"] += "".join(f"{ip} {name}\n" for name, ip in sorted(hosts.items()))
+        for target, content in files.items():
             source = directory / Path(target).name
             source.write_text(content)
             source.chmod(0o644)
@@ -752,8 +763,149 @@ class TaskBoxRuntime:
         return mounts
 
     def create(self, box_id: str, episode_id: str, spec: BoxSpec) -> str:
-        if spec.image not in self.settings.episode_images:
+        if spec.image not in self.settings.episode_images or any(
+                svc.image not in self.settings.episode_images for svc in spec.services):
             raise ValueError("The task image is not approved")
+        hosts: dict[str, str] = {}
+        if spec.services:
+            try:
+                hosts = self._create_services(box_id, episode_id, spec)
+            except Exception as exc:
+                self._remove_services(box_id)
+                if isinstance(exc, InfraFault):
+                    raise
+                raise InfraFault("The task's services could not be started") from exc
+        try:
+            return self._create_box(box_id, episode_id, spec, hosts)
+        except Exception:
+            self._remove_services(box_id)
+            raise
+
+    # -- disk: free space, inodes, I/O ------------------------------------------
+
+    def _docker_root(self) -> str:
+        root = getattr(self, "_docker_root_dir", None)
+        if root is None:
+            root = self._docker_root_dir = self.client.info().get("DockerRootDir") or "/var/lib/docker"
+        return root
+
+    def disk_free_bytes(self) -> int:
+        """Free bytes of the Docker filesystem (where every box's writable layer lives)."""
+        stat = os.statvfs(self._docker_root())
+        return stat.f_bavail * stat.f_frsize
+
+    def _block_device(self) -> str:
+        """The block device holding the Docker root (its loop device on a gateway)."""
+        device = getattr(self, "_docker_block_device", None)
+        if device is None:
+            st = os.stat(self._docker_root())
+            name = Path(f"/sys/dev/block/{os.major(st.st_dev)}:{os.minor(st.st_dev)}").resolve().name
+            device = self._docker_block_device = "/dev/" + name
+        return device
+
+    def _io_max(self) -> str | None:
+        """The box's cgroup `io.max` line for the Docker device, None when no cap is set."""
+        caps = {"rbps": "episode_disk_read_bps", "wbps": "episode_disk_write_bps",
+                "riops": "episode_disk_read_iops", "wiops": "episode_disk_write_iops"}
+        set_ = [f"{key}={int(rate)}" for key, name in caps.items()
+                if (rate := getattr(self.settings, name, None))]
+        if not set_:
+            return None
+        st = os.stat(self._block_device())
+        return f"{os.major(st.st_rdev)}:{os.minor(st.st_rdev)} " + " ".join(set_)
+
+    def _limit_io(self, container: Any) -> None:
+        """Cap the box's disk throughput and IOPS (cgroup v2 `io.max`), written by us right after
+        start, before any agent code: Docker's device_*_bps fail under runsc's systemd cgroups.
+        The Sentry and gofer do the box's I/O inside its scope, so the cap covers it."""
+        line = self._io_max()
+        if line is None:
+            return
+        try:
+            (self._cgroup_scope(container.id) / "io.max").write_text(line + "\n")
+        except OSError as exc:
+            raise InfraFault("The box's disk I/O limit could not be set") from exc
+
+    def _cap_inodes(self, container: Any) -> None:
+        """Add an inode limit to the xfs project quota Docker gave the container's writable
+        layer (Docker sets only its block limit): a box cannot fill the filesystem with files."""
+        limit = getattr(self.settings, "episode_box_inodes", None)
+        if not limit or self.settings.episode_allow_unquoted_disk:
+            return
+        container.reload()
+        upper = ((container.attrs.get("GraphDriver") or {}).get("Data") or {}).get("UpperDir")
+        if not upper:
+            raise InfraFault("The box's writable layer is unknown")
+        found = subprocess.run(["xfs_io", "-c", "lsproj", upper], capture_output=True, text=True,
+                               timeout=30)
+        match = re.search(r"projid = (\d+)", found.stdout)
+        if found.returncode != 0 or not match or match.group(1) == "0":
+            raise InfraFault("The box's project quota id is unknown")
+        done = subprocess.run(["xfs_quota", "-x", "-c", f"limit -p ihard={int(limit)} {match.group(1)}",
+                               self._docker_root()], capture_output=True, text=True, timeout=30)
+        if done.returncode != 0:
+            raise InfraFault("The box's inode limit could not be set")
+
+    def _service_network(self, box_id: str) -> str:
+        """The private network of a box and its sidecars; also its bridge's name (<= 15)."""
+        return "rq-ep-" + hashlib.sha256(self._name(box_id).encode()).hexdigest()[:9]
+
+    def _create_services(self, box_id: str, episode_id: str, spec: BoxSpec) -> dict[str, str]:
+        """An internal network (no route out; inter-container traffic on) and one gVisor box
+        per sidecar. Returns name -> address for the box's /etc/hosts; sidecars reach each
+        other by name through Docker's resolver (their network alias)."""
+        hosts: dict[str, str] = {}
+        net = self._service_network(box_id)
+        labels = {self.LABEL: "sidecar", self.BOX_LABEL: box_id, self.EPISODE_LABEL: episode_id,
+                  self.LABEL_NAMESPACE: self.namespace}
+        self.client.networks.create(net, driver="bridge", internal=True, labels=labels,
+                                    options={"com.docker.network.bridge.name": net})
+        for svc in spec.services:
+            image = self.client.images.get(svc.image)
+            options: dict[str, Any] = {}
+            if not self.settings.episode_allow_unquoted_disk:
+                options["storage_opt"] = {"size": str(SERVICE_DISK_BYTES)}
+            container = self.client.containers.create(
+                image=image.id, command=list(svc.command) or None,
+                name=self._name(box_id) + "-svc-" + svc.name, hostname=svc.name, labels=labels,
+                runtime=self.settings.docker_runtime, user=svc.user, environment=dict(svc.env),
+                network=net, networking_config={
+                    net: self.client.api.create_endpoint_config(aliases=[svc.name])},
+                cap_drop=["ALL"], cap_add=list(TASK_CAPABILITIES),
+                security_opt=["no-new-privileges:true"], privileged=False,
+                pids_limit=SERVICE_PIDS, mem_limit=svc.memory_bytes, memswap_limit=svc.memory_bytes,
+                nano_cpus=min(spec.nano_cpus, round(svc.cpus * 1e9)), init=True, detach=True,
+                log_config=docker.types.LogConfig(type="none"), auto_remove=False, **options)
+            self._cap_inodes(container)
+            container.start()
+            self._limit_io(container)
+            container.reload()
+            address = (((container.attrs.get("NetworkSettings") or {}).get("Networks") or {})
+                       .get(net) or {}).get("IPAddress")
+            if container.status != "running" or not address:
+                raise InfraFault(f"The service {svc.name} did not start")
+            hosts[svc.name] = address
+        return hosts
+
+    def _remove_services(self, box_id: str) -> None:
+        """Remove a box's sidecars and private network, if any (a no-op for most boxes)."""
+        try:
+            for container in self.client.containers.list(all=True, filters={"label": [
+                    self.LABEL + "=sidecar", self.BOX_LABEL + "=" + box_id,
+                    self.LABEL_NAMESPACE + "=" + self.namespace]}):
+                try:
+                    container.remove(force=True)
+                except NotFound:
+                    pass
+            try:
+                self.client.networks.get(self._service_network(box_id)).remove()
+            except NotFound:
+                pass
+        except Exception:
+            _log.warning("could not remove the services of box %s", box_id, exc_info=True)
+
+    def _create_box(self, box_id: str, episode_id: str, spec: BoxSpec,
+                    hosts: dict[str, str]) -> str:
         self._check_helper()
         if (self.settings.docker_runtime != "runsc"
                 and not self.settings.episode_allow_unquoted_disk):
@@ -768,6 +920,15 @@ class TaskBoxRuntime:
         options: dict[str, Any] = {}
         if not self.settings.episode_allow_unquoted_disk:
             options["storage_opt"] = {"size": str(spec.disk_bytes)}
+        # Sidecars take their memory out of the box's budget (the task declares the sum).
+        memory = spec.memory_bytes - sum(svc.memory_bytes for svc in spec.services)
+        if memory < 64 * 1024**2:
+            raise ValueError("The box's memory budget does not cover its services")
+        network_mode, extra = self._network_mode(spec), []
+        if spec.services:
+            network_mode = self._service_network(box_id)
+            if spec.network is not None:
+                extra.append(spec.network)
         try:
             container = self.client.containers.create(
                 image=image.id,
@@ -782,15 +943,15 @@ class TaskBoxRuntime:
                 working_dir=spec.workdir,
                 environment=dict(spec.env),
                 read_only=False,
-                mounts=self._etc_mounts(box_id),
-                network_mode="none",
+                mounts=self._etc_mounts(box_id, hosts),
+                network_mode=network_mode,
                 cap_drop=["ALL"],
                 cap_add=list(TASK_CAPABILITIES),
                 security_opt=["no-new-privileges:true"],
                 privileged=False,
                 pids_limit=spec.pids,
-                mem_limit=spec.memory_bytes,
-                memswap_limit=spec.memory_bytes,
+                mem_limit=memory,
+                memswap_limit=memory,
                 nano_cpus=spec.nano_cpus,
                 init=True,
                 detach=True,
@@ -802,10 +963,18 @@ class TaskBoxRuntime:
             shutil.rmtree(self._etc_dir(box_id), ignore_errors=True)
             raise InfraFault("The task box could not be created") from exc
         try:
+            self._cap_inodes(container)
+            for name in extra:  # the egress network too, for an online box with sidecars
+                self.client.networks.get(name).connect(container)
             container.start()
+            self._limit_io(container)
             container.reload()
             if container.status != "running":
                 raise InfraFault("The task box failed to start")
+            if spec.network is not None:  # joins the egress proxy's per-source log to the episode
+                address = (((container.attrs.get("NetworkSettings") or {}).get("Networks") or {}).get(
+                    spec.network) or {}).get("IPAddress")
+                _log.info("egress box %s episode %s address %s", box_id, episode_id, address)
             made = self.exec(box_id, [HELPER, "sh", "-c", MAKE_TOOLS_DIR, "mk", TOOLS_DIR],
                              timeout_s=30, output_limit=4096, user="0", workdir="/")
             if made.exit_code != 0 or made.timed_out:
@@ -821,6 +990,31 @@ class TaskBoxRuntime:
             if isinstance(exc, InfraFault):
                 raise
             raise InfraFault("The task box failed to start") from exc
+
+    def _network_mode(self, spec: BoxSpec) -> str:
+        """"none" unless the box is online, then only the configured egress network."""
+        if spec.network is None:
+            return "none"
+        if spec.network != getattr(self.settings, "episode_egress_network", None):
+            raise ValueError("The box network is not this machine's egress network")
+        return spec.network
+
+    def check_egress_network(self) -> None:
+        """The egress network must be an internal bridge with inter-box traffic off: boxes
+        then reach only the host (the proxy listener; the host firewall drops the rest)."""
+        name = getattr(self.settings, "episode_egress_network", None)
+        if not name:
+            return
+        try:
+            attrs = self.client.networks.get(name).attrs
+        except Exception as exc:
+            raise InfraUnavailable(f"The egress network {name!r} is missing") from exc
+        options = attrs.get("Options") or {}
+        if (attrs.get("Driver") != "bridge" or attrs.get("Internal") is not True
+                or options.get("com.docker.network.bridge.enable_icc") != "false"
+                or attrs.get("EnableIPv6")):
+            raise InfraUnavailable(f"The egress network {name!r} must be an internal IPv4 bridge "
+                                   "with enable_icc=false")
 
     def _container(self, box_id: str) -> Any:
         container = self.client.containers.get(self._name(box_id))
@@ -843,6 +1037,7 @@ class TaskBoxRuntime:
             self._container(box_id).remove(force=True)
         except NotFound:
             pass
+        self._remove_services(box_id)
         self._cpu_last.pop(box_id, None)
         self._box_users.pop(box_id, None)
         self._helper_retries.pop(box_id, None)

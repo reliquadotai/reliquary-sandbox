@@ -7,7 +7,12 @@ from typing import Any, Literal
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from reliquary_sandbox.episode_task import IMAGE_DIGEST, VERIFIERS_ENTRY, VERIFIERS_ENTRY_PREFIX
+from reliquary_sandbox.episode_task import (
+    EGRESS_PROFILE,
+    IMAGE_DIGEST,
+    VERIFIERS_ENTRY,
+    VERIFIERS_ENTRY_PREFIX,
+)
 from reliquary_sandbox.observation import MAX_ARGUMENT_BYTES
 
 ENTRY_POINT = r"[A-Za-z_][\w.]*:[A-Za-z_]\w*"
@@ -45,6 +50,16 @@ def _http_url(value: str, name: str, allow_path: bool) -> str:
     if parsed.scheme == "http" and parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
         raise ValueError(f"non-loopback {name} must use HTTPS")
     return value.rstrip("/")
+
+
+def egress_env(profile: dict[str, Any]) -> dict[str, str]:
+    """The env vars an online box gets: its profile's proxy for every proxy-aware tool
+    (pip, uv, apt, curl, git, npm), then the profile's own (e.g. index pins)."""
+    proxy = str(profile["proxy"])
+    env = {name: proxy for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")}
+    env.update(NO_PROXY="localhost,127.0.0.1,::1", no_proxy="localhost,127.0.0.1,::1")
+    env.update(profile.get("env") or {})
+    return env
 
 
 MAX_PRESENT_WINDOW_S = 120
@@ -160,6 +175,61 @@ class Settings(BaseSettings):
     # How often the episode host checks (preflight without the quota probe) run;
     # `/readyz` serves the last verdict.
     episode_host_check_seconds: float = Field(default=30, ge=0.01, le=3600)
+    # Per-box limits beyond memory/CPU/pids/disk blocks (docs/egress.md, "Gateway limits"); unset = off.
+    # Inodes of a box's writable layer (an xfs project inode limit next to Docker's block limit).
+    episode_box_inodes: int | None = Field(default=None, ge=1000)
+    # Opens are refused (503, signed, retryable) while the Docker filesystem has less free space.
+    episode_min_free_disk_bytes: int | None = Field(default=None, ge=0)
+    # Disk throughput and operations per second of each box on the Docker filesystem's device.
+    episode_disk_read_bps: int | None = Field(default=None, ge=1024**2)
+    episode_disk_write_bps: int | None = Field(default=None, ge=1024**2)
+    episode_disk_read_iops: int | None = Field(default=None, ge=10)
+    episode_disk_write_iops: int | None = Field(default=None, ge=10)
+    # HTTP requests per second (and burst) per credential (episode key, tenant token) and per
+    # client address (Caddy's X-Forwarded-For from loopback); 0 = no limit.
+    api_rate_per_key: float = Field(default=0, ge=0)
+    api_burst_per_key: float = Field(default=40, ge=1)
+    api_rate_per_ip: float = Field(default=0, ge=0)
+    api_burst_per_ip: float = Field(default=200, ge=1)
+    # Controlled egress (docs/egress.md), off unless profiles are set: the Docker network
+    # (internal bridge, inter-box traffic off) online boxes join, each profile's proxy URL
+    # (`http://<bridge ip>:<port>`, the egress proxy's listener for it) and the env vars it
+    # adds to online boxes, and the profiles each env may use.
+    episode_egress_network: str | None = Field(default=None, pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$")
+    episode_egress_profiles: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    episode_egress_envs: dict[str, list[str]] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_egress(self):
+        from urllib.parse import urlparse
+
+        for name, profile in self.episode_egress_profiles.items():
+            if not EGRESS_PROFILE.fullmatch(name):
+                raise ValueError(f"egress profile {name!r}: names are [a-z][a-z0-9-]{{0,31}}")
+            if set(profile) - {"proxy", "env"}:
+                raise ValueError(f"egress profile {name!r}: only 'proxy' and 'env' are known")
+            proxy = urlparse(str(profile.get("proxy", "")))
+            if (proxy.scheme != "http" or not proxy.hostname or not proxy.port
+                    or proxy.path.strip("/") or proxy.username):
+                raise ValueError(f"egress profile {name!r}: proxy must be http://<ip>:<port>")
+            env = profile.get("env", {})
+            if not isinstance(env, dict) or not all(
+                    isinstance(k, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", k)
+                    and isinstance(v, str) and len(v) <= 4096 for k, v in env.items()):
+                raise ValueError(f"egress profile {name!r}: env maps variable names to strings")
+        for env, profiles in self.episode_egress_envs.items():
+            unknown = [p for p in profiles if p not in self.episode_egress_profiles]
+            if unknown:
+                raise ValueError(f"episode_egress_envs[{env!r}] names unknown profiles {unknown}")
+        if self.episode_egress_profiles and not self.episode_egress_network:
+            raise ValueError("egress profiles need episode_egress_network")
+        return self
+
+    def egress_profile_for(self, env: str, profile: str) -> dict[str, Any] | None:
+        """The profile when `env` may use it on this machine, else None."""
+        if profile not in self.episode_egress_envs.get(env, ()):
+            return None
+        return self.episode_egress_profiles.get(profile)
 
     @field_validator("tokens")
     @classmethod

@@ -56,7 +56,7 @@ from reliquary_sandbox.attest.records import STATUS_BOX_FAILED
 from reliquary_sandbox.episode_task import SandboxTask
 from reliquary_sandbox.observation import MAX_ARGUMENT_BYTES
 
-from ..settings import transcript_reserve_bytes
+from ..settings import egress_env, transcript_reserve_bytes
 from ..task_runtime import BoxFault, BoxSpec, InfraFault
 from .grader import RETRY_MARGIN_S, Grader, run_step
 from .registry import TaskRegistry, TaskResolutionError, task_fingerprint
@@ -385,10 +385,19 @@ class EpisodeManager:
         # Clamped before rounding: a huge request overflows to inf, which round() refuses.
         return max(100_000_000, round(min(machine, task.limits.cpus * 1_000_000_000)))
 
-    def _spec(self, task: SandboxTask, budgets: Budgets, lifetime_s: int) -> BoxSpec:
-        return BoxSpec(image=task.image, workdir=task.workdir, env=dict(task.env), user=task.user,
+    def _spec(self, task: SandboxTask, budgets: Budgets, lifetime_s: int, *, env: str = "",
+              phase: str = "agent") -> BoxSpec:
+        box_env, network = dict(task.env), None
+        if task.network is not None and task.network.online(phase):
+            profile = self.settings.egress_profile_for(env, task.network.profile)
+            if profile is None:  # checked at open; a settings change since is ours
+                raise InfraFault("the task's egress profile is not offered on this machine")
+            network = self.settings.episode_egress_network
+            box_env.update(egress_env(profile))
+        return BoxSpec(image=task.image, workdir=task.workdir, env=box_env, user=task.user,
                        memory_bytes=budgets.memory_bytes, nano_cpus=self._nano_cpus(task),
-                       pids=budgets.pids, disk_bytes=budgets.disk_bytes, lifetime_s=lifetime_s)
+                       pids=budgets.pids, disk_bytes=budgets.disk_bytes, lifetime_s=lifetime_s,
+                       network=network, services=task.services)
 
     def _remove_boxes(self, episode: dict[str, Any], box_ids: list[str]) -> None:
         """Remove boxes now; the ones that could not be removed go to `cleanup` (the reaper)."""
@@ -443,8 +452,14 @@ class EpisodeManager:
         if task.image != claims.image:
             raise self._refuse_signed(claims, digest, token, 422,
                                       "the token's image is not this task's image", "task_refused")
-        if task.image not in self.settings.episode_images:
+        if task.image not in self.settings.episode_images or any(
+                svc.image not in self.settings.episode_images for svc in task.services):
             raise self._refuse_signed(claims, digest, token, 422, "image not approved on this machine",
+                                      "task_refused")
+        if (task.network is not None
+                and self.settings.egress_profile_for(claims.env, task.network.profile) is None):
+            raise self._refuse_signed(claims, digest, token, 422,
+                                      "the task's egress profile is not offered on this machine",
                                       "task_refused")
         if not grading_fits_the_window(task.grading_timeout_s):
             raise self._refuse_signed(
@@ -455,7 +470,8 @@ class EpisodeManager:
             raise self._refuse_signed(
                 claims, digest, token, 422,
                 f"session budgets are below the task's needs: {', '.join(short)}", "task_refused")
-        if not self.boxes.image_present(task.image):   # a set lookup in the image inventory
+        if not all(self.boxes.image_present(image)    # set lookups in the image inventory
+                   for image in (task.image, *(svc.image for svc in task.services))):
             raise self._refuse_signed(claims, digest, token, 409, "image not present on this machine",
                                       "task_refused")
         accounted = resources_enabled(self.settings)
@@ -493,6 +509,12 @@ class EpisodeManager:
             # Past this an OPENING row whose lock is free has no opener (see `reap`).
             "open_by": now + math.ceil(task.prepare_timeout_s) + PREPARE_SLACK_S,
         }
+        floor = getattr(self.settings, "episode_min_free_disk_bytes", None)
+        free = getattr(self.boxes, "disk_free_bytes", None)
+        if floor and free is not None and free() < floor:
+            # (an existing receipt reason: validators of any version accept it)
+            raise self._refuse_signed(claims, digest, token, 503, "no free disk", "no_free_resources",
+                                      {"Retry-After": RETRY_AFTER_S})
         with self.lock:
             active = self.store.reserving(include_grading=self.grading_pool is None)
             if len(active) >= self.settings.episode_capacity:
@@ -665,7 +687,8 @@ class EpisodeManager:
                  lifetime_s: int) -> str:
         """Create the agent's box, persist its resolved user, run the env's `prepare`."""
         box_id = episode["box_id"]
-        self.boxes.create(box_id, episode["id"], self._spec(task, budgets, lifetime_s))
+        self.boxes.create(box_id, episode["id"], self._spec(task, budgets, lifetime_s,
+                                                            env=episode["claims"]["env"]))
         uid_gid = self.boxes.box_user(box_id)
         if uid_gid is None:
             raise InfraFault("the box user was not resolved at creation")
@@ -889,7 +912,8 @@ class EpisodeManager:
         claims = episode["claims"]
         task = self._task(episode)
         budgets = Budgets.from_dict(claims["budgets"])
-        spec = self._spec(task, budgets, math.ceil(task.grading_timeout_s) + BOX_GRACE_S)
+        spec = self._spec(task, budgets, math.ceil(task.grading_timeout_s) + BOX_GRACE_S,
+                          env=claims["env"], phase="grading")
         deadline = claims["expires_at"] + GRADING_GRACE_S - WINDOW_MARGIN_S
         outcome = self.grader.grade(episode["id"], episode["box_id"], task, spec,
                                     env=claims["env"], deadline=deadline, owner=claims["hotkey"])

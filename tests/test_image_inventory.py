@@ -185,6 +185,6 @@ def test_a_create_that_finds_its_image_gone_invalidates_the_inventory(tmp_path):
     assert boxes.image_present(IMAGE) and client.lists == 1
     client.local = []
     with pytest.raises(InfraUnavailable):
-        boxes.create("box-1", "s-1", SimpleNamespace(image=IMAGE))
+        boxes.create("box-1", "s-1", SimpleNamespace(image=IMAGE, services=()))
     assert client.gets == 1
     assert not boxes.image_present(IMAGE) and client.lists == 2   # the next lookup lists again

@@ -88,6 +88,12 @@ def capacity_report(manager: Any) -> dict[str, Any]:
     pool = getattr(manager, "grading_pool", None)
     if pool is not None:        # absent without a pool: older reports keep their bytes
         document["grading_pool"] = pool.snapshot()
+    pending = sorted(set(settings.episode_images) - set(document["images"]))
+    if pending:  # approved images still pulling (or gone): placed later, never refused for good
+        document["images_pending"] = pending
+    egress = getattr(settings, "episode_egress_envs", None)
+    if egress:  # absent without egress: older reports keep their bytes
+        document["egress"] = {env: sorted(profiles) for env, profiles in sorted(egress.items())}
     image_locks = getattr(manager.registry, "image_locks", None)
     locks = image_locks() if callable(image_locks) else {}
     if locks:   # absent on a machine serving no bridged env: older reports keep their bytes
