@@ -14,6 +14,9 @@ later, the sandbox gateway (observations). Nothing here runs a tool or loads a m
 * `mini.py`: mini-swe-agent's text-based harness (`MINI_SWE_V1`, `mini-swe@1`): one fenced
   bash block per turn, mini's observation and format-error texts (MIT, see
   `MINI_SWE_AGENT_LICENSE.md`), the submit command ending the episode.
+* `terminus.py`: Harbor's Terminus 2 (`TERMINUS_2_V1`, `terminus-2@1`, the Terminal-Bench 2.x reference agent):
+  its JSON prompt and parser (Apache-2.0, see `HARBOR_LICENSE.md`), each turn's keystrokes typed into a
+  `bash -i` whose session is saved and restored across turns, the double `task_complete` confirmation.
 * `engine.py`: one model turn on a vLLM `/inference/v1/generate` endpoint, as verifiers'
   train client sends it.
 * `loop.py`: the episode loop and its stops.

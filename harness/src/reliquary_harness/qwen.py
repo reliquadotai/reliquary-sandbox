@@ -110,6 +110,7 @@ class QwenTurnRenderer:
         self._tools = [dict(tool) for tool in spec.tool_specs(tools, values)]
         self._system_prompt = spec.system_prompt_for(tools, values)
         self._im_start = int(renderer._token_id("<|im_start|>"))
+        self._im_end = int(renderer._token_id("<|im_end|>"))
         self._think = int(renderer._token_id("<think>"))
         self._think_end = int(renderer._token_id("</think>"))
         literals = set(getattr(self._tokenizer, "all_special_tokens", []) or [])
@@ -137,9 +138,10 @@ class QwenTurnRenderer:
 
     @_locked
     def initial_ids(self, prompt: str) -> list[int]:
+        # A harness without a system prompt (terminus) sends none: the template's default stands.
+        system = [{"role": "system", "content": self._system_prompt}] if self._system_prompt else []
         rendered = self._r.render(
-            [{"role": "system", "content": self._system_prompt},
-             {"role": "user", "content": self.spec.user_prompt(prompt)}],
+            [*system, {"role": "user", "content": self.spec.user_prompt(prompt)}],
             tools=self._shown_tools, add_generation_prompt=True)
         return [int(t) for t in rendered.token_ids]
 
@@ -167,8 +169,26 @@ class QwenTurnRenderer:
                     for call in parsed or [] if getattr(call, "name", None)]
         return pinned_tool_calls(parsed, self._unknown)
 
+    @property
+    def reads_prompt(self) -> bool:
+        """Whether a turn's calls depend on its prompt (terminus: a pending confirmation): `tool_calls` then
+        needs `prompt_ids`."""
+        return bool(getattr(self._translator, "READS_EARLIER_TURNS", False))
+
+    def _user_texts(self, prompt_ids):
+        """The prompt's user messages, newest first, as the template rendered them."""
+        ids = [int(t) for t in prompt_ids]
+        starts = [k for k, t in enumerate(ids) if t == self._im_start]
+        for k in reversed(starts):
+            end = next((j for j in range(k + 1, len(ids)) if ids[j] == self._im_end), len(ids))
+            text = self._tokenizer.decode(ids[k + 1:end], skip_special_tokens=False,
+                                          clean_up_tokenization_spaces=False)
+            if text.startswith("user\n"):
+                yield text[len("user\n"):]
+
     @_locked
-    def tool_calls(self, completion_ids) -> list[tuple[str, str]]:
+    def tool_calls(self, completion_ids, prompt_ids=None) -> list[tuple[str, str]]:
+        """The calls of a turn; `prompt_ids` (the prompt the turn answers) is required when `reads_prompt`."""
         if self._translator is not None:
             surface = self._surface_calls(completion_ids)
             whole_turn = getattr(self._translator, "turn_actions", None)
@@ -176,7 +196,12 @@ class QwenTurnRenderer:
                 # The harness reads the turn as a whole (mini: no call or any bad call is one format error, a
                 # submit ends the episode): `ended` is whether the turn stopped on a stop id (not at its cap).
                 ended = bool(completion_ids) and int(completion_ids[-1]) in self.stop_ids
-                surface = whole_turn(surface, ended=ended)
+                context = {}
+                if self.reads_prompt:
+                    if prompt_ids is None:
+                        raise ValueError(f"{self.spec.key} reads a turn with the prompt it answers")
+                    context["earlier"] = self._user_texts(prompt_ids)
+                surface = whole_turn(surface, ended=ended, **context)
                 if surface is None:
                     return []
             calls = [self._translator.translate(name, arguments, self._offered) for name, arguments in surface]
@@ -187,8 +212,8 @@ class QwenTurnRenderer:
     def turn_calls(self, result) -> list[tuple[str, str, str]]:
         """`(id, canonical name, arguments)` of a generate result (`renderers.client.generate`'s dict)."""
         if self._text or self._translator is not None:
-            return [(f"call_{i}", name, arguments)
-                    for i, (name, arguments) in enumerate(self.tool_calls(result["completion_ids"]))]
+            return [(f"call_{i}", name, arguments) for i, (name, arguments)
+                    in enumerate(self.tool_calls(result["completion_ids"], result.get("prompt_ids")))]
         return self.calls_of(result.get("tool_calls"))
 
     def refusal_observation(self, name: str, arguments: str | None) -> str | None:
