@@ -82,7 +82,7 @@ import verifiers.v1 as vf
 from verifiers.v1.state import state_cls
 from verifiers.v1.trace import Trace, TraceTask
 
-from reliquary_sandbox.episode_task import EnvInfraError, GradeResult, SandboxTask
+from reliquary_sandbox.episode_task import EnvInfraError, GradeResult, SandboxTask, TaskNetwork
 
 from . import scoring_process
 from .declaration import (
@@ -278,7 +278,8 @@ def clearing_commands(absent: list[str], workdir: str) -> list[list[str]]:
 
 def task_from_verifiers(task: Any, *, lock: ImageLock, tools: tuple[str, ...] = DEFAULT_TOOLS,
                         defaults: BridgeDefaults = BridgeDefaults(),
-                        publish_state: bool = False) -> SandboxTask:
+                        publish_state: bool = False,
+                        network: TaskNetwork | None = None) -> SandboxTask:
     """The SandboxTask serving `task` (a verifiers v1 Task). Raises TaskDeclarationError
     for a task the sandbox cannot serve."""
     data = task.data
@@ -394,4 +395,4 @@ def task_from_verifiers(task: Any, *, lock: ImageLock, tools: tuple[str, ...] = 
         max_state_bytes=max_state_bytes,
         prepare_timeout_s=prepare_s,
         grading_timeout_s=scoring_timeout_s,
-        publish_state=publish_state, limits=limits, content_sha256=task.hash)
+        publish_state=publish_state, limits=limits, content_sha256=task.hash, network=network)

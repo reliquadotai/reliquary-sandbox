@@ -198,6 +198,72 @@ class TaskLimits:
                 if (need := getattr(self, name)) is not None and getattr(budgets, name) < need]
 
 
+EGRESS_PROFILE = re.compile(r"[a-z][a-z0-9-]{0,31}")
+
+
+@dataclass(frozen=True)
+class TaskNetwork:
+    """Controlled egress a task needs (default: none, the box is offline).
+
+    The box reaches the internet only through the gateway's egress proxy for `profile`
+    (a host allowlist with byte and rate caps, named by the gateway's settings), in the
+    phases set here. A gateway that does not offer the profile for the env refuses the
+    task. Grading with network makes the verdict depend on what upstream serves: pin
+    versions in the task (the profile's env pins package indexes to a date)."""
+
+    profile: str
+    agent: bool = False
+    """The agent's box is online (the agent may also look things up)."""
+    grading: bool = True
+    """The pristine grading box is online (tests that download their tools)."""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.profile, str) or not EGRESS_PROFILE.fullmatch(self.profile):
+            raise ValueError("an egress profile is [a-z][a-z0-9-]{0,31}")
+        if not isinstance(self.agent, bool) or not isinstance(self.grading, bool):
+            raise ValueError("network phases are booleans")
+        if not (self.agent or self.grading):
+            raise ValueError("a task network is online in at least one phase")
+
+    def online(self, phase: str) -> bool:
+        return self.agent if phase == "agent" else self.grading
+
+
+SERVICE_NAME = re.compile(r"[a-z][a-z0-9-]{0,62}")
+MAX_SERVICES = 8
+MIN_MAIN_MEMORY = 256 * 1024**2
+
+
+@dataclass(frozen=True)
+class TaskService:
+    """A sidecar of the task (a compose service other than the one the agent works in):
+    its own gVisor box from an approved image, on a private network with the task's box,
+    which reaches it by `name`. Offline, never reachable from other episodes. Created
+    with the agent's box and again, fresh, with each grading box. Its memory and CPUs come
+    out of the task's (declare `TaskLimits.memory_bytes` to cover them)."""
+
+    name: str
+    image: str
+    command: tuple[str, ...] = ()
+    """() = the image's own command."""
+    env: Mapping[str, str] = field(default_factory=dict)
+    user: str | None = None
+    memory_bytes: int = 512 * 1024**2
+    cpus: float = 0.5
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not SERVICE_NAME.fullmatch(self.name):
+            raise ValueError("a service name is [a-z][a-z0-9-]{0,62}")
+        if not IMAGE_DIGEST.fullmatch(self.image):
+            raise ValueError("a service image must be pinned by digest")
+        if not isinstance(self.command, tuple) or not all(isinstance(a, str) for a in self.command):
+            raise ValueError("a service command is a tuple of strings")
+        if type(self.memory_bytes) is not int or self.memory_bytes < 64 * 1024**2:
+            raise ValueError("a service needs at least 64 MiB")
+        if not isinstance(self.cpus, (int, float)) or not 0 < self.cpus <= 64:
+            raise ValueError("service cpus must be in (0, 64]")
+
+
 @dataclass(frozen=True)
 class SandboxTask:
     image: str
@@ -239,8 +305,24 @@ class SandboxTask:
     """sha256 (64 hex) of what the task asks, when the declaration's other fields do not
     say it (a verifiers task's `Task.hash`). Part of the task fingerprint when set: a task
     whose content changed under the same index is not the one an episode opened."""
+    network: TaskNetwork | None = None
+    """Controlled egress (TaskNetwork); None = offline in every phase."""
+    services: tuple[TaskService, ...] = ()
+    """Sidecars (TaskService), reached by name from the task's boxes."""
 
     def __post_init__(self) -> None:
+        if not isinstance(self.services, tuple) or not all(
+                isinstance(svc, TaskService) for svc in self.services):
+            raise TypeError("services must be a tuple of TaskService")
+        if len(self.services) > MAX_SERVICES:
+            raise ValueError(f"at most {MAX_SERVICES} services")
+        if len({svc.name for svc in self.services}) != len(self.services):
+            raise ValueError("service names must be unique")
+        if self.services and (self.limits.memory_bytes is None or self.limits.memory_bytes
+                              < sum(svc.memory_bytes for svc in self.services) + MIN_MAIN_MEMORY):
+            raise ValueError("limits.memory_bytes must cover the services and 256 MiB for the task's box")
+        if self.network is not None and not isinstance(self.network, TaskNetwork):
+            raise TypeError("network must be a TaskNetwork or None")
         if not isinstance(self.limits, TaskLimits):
             raise TypeError("limits must be a TaskLimits")
         if self.content_sha256 is not None and not re.fullmatch(r"[0-9a-f]{64}",

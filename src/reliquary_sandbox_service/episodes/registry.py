@@ -216,4 +216,12 @@ def task_fingerprint(resolved: ResolvedTask) -> str:
     }
     if task.content_sha256 is not None:  # absent otherwise: existing fingerprints unchanged
         declared["content_sha256"] = task.content_sha256
+    if task.services:  # likewise: tasks without sidecars keep their fingerprints
+        declared["services"] = [
+            {"name": svc.name, "image": svc.image, "command": list(svc.command),
+             "env": dict(svc.env), "user": svc.user, "memory_bytes": svc.memory_bytes,
+             "cpus": float(svc.cpus)} for svc in task.services]
+    if task.network is not None:  # likewise: offline tasks keep their fingerprints
+        declared["network"] = {"profile": task.network.profile, "agent": task.network.agent,
+                               "grading": task.network.grading}
     return hashlib.sha256(canonical_json(declared)).hexdigest()

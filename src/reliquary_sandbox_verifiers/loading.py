@@ -27,6 +27,7 @@ from reliquary_sandbox.episode_task import (
     VERIFIERS_ENTRY,
     VERIFIERS_ENTRY_PREFIX,
     SandboxTask,
+    TaskNetwork,
 )
 
 from .bridge import task_from_verifiers
@@ -95,6 +96,9 @@ class VerifiersEnvOptions:
     """Served split -> taskset config overrides. Default: `rl`, with `split="rl"`."""
     defaults: BridgeDefaults = BridgeDefaults()
     publish_state: bool = False
+    network: TaskNetwork | None = None
+    """Controlled egress for every task of the env (`{"profile", "agent", "grading"}`);
+    None = offline. Omitted from `effective()` when None, so offline digests are unchanged."""
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any] | None) -> VerifiersEnvOptions:
@@ -122,6 +126,14 @@ class VerifiersEnvOptions:
             if not isinstance(raw["publish_state"], bool):
                 raise ValueError("publish_state must be a boolean")
             values["publish_state"] = raw["publish_state"]
+        if raw.get("network") is not None:
+            network = raw["network"]
+            if not isinstance(network, Mapping) or set(network) - {"profile", "agent", "grading"}:
+                raise ValueError("network must be {profile, agent?, grading?}")
+            try:
+                values["network"] = TaskNetwork(**network)
+            except TypeError as exc:
+                raise ValueError(f"invalid network: {exc}") from exc
         return cls(**values)
 
     def effective(self) -> dict[str, Any]:
@@ -134,7 +146,10 @@ class VerifiersEnvOptions:
                 defaults[f.name] = float(defaults[f.name])
         return {"tools": sorted(self.tools),
                 "splits": {name: dict(overrides) for name, overrides in self.splits.items()},
-                "defaults": defaults, "publish_state": self.publish_state}
+                "defaults": defaults, "publish_state": self.publish_state,
+                **({} if self.network is None else {"network": {
+                    "profile": self.network.profile, "agent": self.network.agent,
+                    "grading": self.network.grading}})}
 
     def sha256(self) -> str:
         """sha256 hex of the canonical JSON of `effective()`: what the capacity report
@@ -263,4 +278,5 @@ class VerifiersEnv:
     def sandbox_task(self, split: str, index: int) -> SandboxTask:
         return task_from_verifiers(self.task(split, index), lock=self.lock,
                                    tools=self.options.tools, defaults=self.options.defaults,
-                                   publish_state=self.options.publish_state)
+                                   publish_state=self.options.publish_state,
+                                   network=self.options.network)
