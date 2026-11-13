@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any
 
 IMPLEMENTATION_FILES = ("spec.py", "qwen.py", "loop.py", "engine.py", "variant.py", "mini.py", "openhands.py",
-                        "claude_code.py", "codex.py", "codex_patch.py")
+                        "claude_code.py", "codex.py", "codex_patch.py", "terminus.py")
 """The package modules whose source the digest covers: they decide every token."""
 
 
@@ -177,7 +177,7 @@ class HarnessSpec:
         return f"{content}{self.network_notice['join']}{notice}" if content else notice
 
 
-TRANSLATORS = ("openhands", "claude_code", "codex", "mini")
+TRANSLATORS = ("openhands", "claude_code", "codex", "mini", "terminus")
 """The translated harnesses this package has: each a module of the package (`openhands.py`, ...)."""
 
 
@@ -441,8 +441,51 @@ def _codex_v1() -> HarnessSpec:
 
 CODEX_V1 = _codex_v1()
 
+HARBOR_COMMIT = "06d0e86a8cfbac213548e0caec533afc5d81ff31"
+
+
+def _terminus_2_v1() -> HarnessSpec:
+    from . import terminus
+
+    return dataclasses.replace(
+        BASH_VF_B2E4E81,
+        id="terminus-2",
+        version="1",
+        family="terminus",
+        # Terminus' prompt (`templates/terminus-json-plain.txt`) as the first user message, no system message.
+        system_prompt={"harness": "terminus", "instance": terminus.INSTANCE},
+        parse={"filter": "terminus-json-plain", "parser": "terminus_json_plain_parser.TerminusJSONPlainParser",
+               "turn": "one canonical bash call of the turn's keystrokes; a parsing error is answered locally",
+               "errors": {"parse": terminus.PARSE_ERROR_CALL, "length": terminus.LENGTH_ERROR_CALL},
+               "complete": "task_complete twice in a row (parsing errors in between skipped) ends the episode",
+               "context": "the turn's prompt (the pending confirmation)", "on_error": "refuse-span"},
+        observation={"format": "reliquary-observation/1", "tools_versions": ["reliquary-tools/1"], "shown": "terminus",
+                     "message": {"role": "user"}, "limit_bytes": terminus.MAX_OUTPUT_BYTES,
+                     "state_dir": terminus.STATE_DIR},
+        stops={"before_model_call": ["max_turns", "episode_closed"],
+               "after_turn": {"task_complete_confirmed": "agent_completed"},
+               "overlong_prompt": "context_length", "closed_on_a_call": "episode_closed", "max_tokens_per_turn": "job"},
+        actions={"mode": "translated", "harness": "terminus", "calls": "text"},
+        upstream={"harbor": HARBOR_COMMIT,
+                  "files": {
+                      "src/harbor/agents/terminus_2/templates/terminus-json-plain.txt":
+                          "89a3dc3a15752b748a99fb907c9251ab31a464e13386583fb48476b078b54a34",
+                      "src/harbor/agents/terminus_2/terminus_json_plain_parser.py":
+                          "ba7eeaeb28e2f72ecdc5850617c77cc571692c68698306637cc2cfed41130688",
+                      "src/harbor/agents/terminus_2/terminus_2.py":
+                          "34ab46005280c50dd63fc075a3fdbb224421d88751bff6f514d23f5e4b2eaf35",
+                      "src/harbor/agents/terminus_2/tmux_session.py":
+                          "d5937cf4330ccf49bdb8709fe341609fe986d30b25826a1145f31de23cf11599",
+                  }},
+    )
+
+
+TERMINUS_2_V1 = _terminus_2_v1()
+"""Harbor's Terminus 2 (JSON), the Terminal-Bench 2.x reference agent, on the canonical bash (`terminus.py`)."""
+
 SPECS: dict[str, HarnessSpec] = {spec.key: spec for spec in (BASH_VF_B2E4E81, BASH_SURFACE_V1, MINI_SWE_V2,
-                                                               OPENHANDS_XML_V1, CLAUDE_CODE_V1, CODEX_V1)}
+                                                               OPENHANDS_XML_V1, CLAUDE_CODE_V1, CODEX_V1,
+                                                               TERMINUS_2_V1)}
 
 
 def get_spec(harness_id: str, version: str) -> HarnessSpec:
@@ -465,7 +508,7 @@ def digest_refusal(harness_id: str, version: str, digest: str) -> str | None:
     return None
 
 
-__all__ = ["BASH_SENTENCE", "BASH_SURFACE_V1", "MINI_SWE_V2", "BASH_TOOL", "BASH_VF_B2E4E81", "OBSERVATION_FORMATS",
+__all__ = ["BASH_SENTENCE", "BASH_SURFACE_V1", "MINI_SWE_V2", "TERMINUS_2_V1", "BASH_TOOL", "BASH_VF_B2E4E81", "OBSERVATION_FORMATS",
            "decorate_observation", "CAPABILITY_NOTICE", "EDIT_SENTENCE", "EDIT_TOOL",
            "HarnessSpec", "SPECS", "VERIFIERS_COMMIT", "canonical_json", "digest_refusal", "get_spec",
            "harness_digest", "implementation_sha256"]
