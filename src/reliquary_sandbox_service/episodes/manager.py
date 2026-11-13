@@ -509,6 +509,12 @@ class EpisodeManager:
             # Past this an OPENING row whose lock is free has no opener (see `reap`).
             "open_by": now + math.ceil(task.prepare_timeout_s) + PREPARE_SLACK_S,
         }
+        floor = getattr(self.settings, "episode_min_free_disk_bytes", None)
+        free = getattr(self.boxes, "disk_free_bytes", None)
+        if floor and free is not None and free() < floor:
+            # (an existing receipt reason: validators of any version accept it)
+            raise self._refuse_signed(claims, digest, token, 503, "no free disk", "no_free_resources",
+                                      {"Retry-After": RETRY_AFTER_S})
         with self.lock:
             active = self.store.reserving(include_grading=self.grading_pool is None)
             if len(active) >= self.settings.episode_capacity:

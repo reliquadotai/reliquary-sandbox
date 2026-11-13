@@ -175,6 +175,22 @@ class Settings(BaseSettings):
     # How often the episode host checks (preflight without the quota probe) run;
     # `/readyz` serves the last verdict.
     episode_host_check_seconds: float = Field(default=30, ge=0.01, le=3600)
+    # Per-box limits beyond memory/CPU/pids/disk blocks (docs/egress.md, "Gateway limits"); unset = off.
+    # Inodes of a box's writable layer (an xfs project inode limit next to Docker's block limit).
+    episode_box_inodes: int | None = Field(default=None, ge=1000)
+    # Opens are refused (503, signed, retryable) while the Docker filesystem has less free space.
+    episode_min_free_disk_bytes: int | None = Field(default=None, ge=0)
+    # Disk throughput and operations per second of each box on the Docker filesystem's device.
+    episode_disk_read_bps: int | None = Field(default=None, ge=1024**2)
+    episode_disk_write_bps: int | None = Field(default=None, ge=1024**2)
+    episode_disk_read_iops: int | None = Field(default=None, ge=10)
+    episode_disk_write_iops: int | None = Field(default=None, ge=10)
+    # HTTP requests per second (and burst) per credential (episode key, tenant token) and per
+    # client address (Caddy's X-Forwarded-For from loopback); 0 = no limit.
+    api_rate_per_key: float = Field(default=0, ge=0)
+    api_burst_per_key: float = Field(default=40, ge=1)
+    api_rate_per_ip: float = Field(default=0, ge=0)
+    api_burst_per_ip: float = Field(default=200, ge=1)
     # Controlled egress (docs/egress.md), off unless profiles are set: the Docker network
     # (internal bridge, inter-box traffic off) online boxes join, each profile's proxy URL
     # (`http://<bridge ip>:<port>`, the egress proxy's listener for it) and the env vars it

@@ -64,3 +64,23 @@ sidecars plus 256 MiB; the box gets the rest.
 Grading boxes get fresh sidecars: a test that checks state the agent left in a sidecar (a database
 it filled) needs that state extracted by the env, or the pod variant (docs: Catalyst
 `docs/design/2026-11-13-sandbox-network-compose.md`).
+
+## Gateway limits
+
+A session token is enough to run anything in a box, so each box is bounded so that it cannot take
+the gateway down for the others. Each limit below is off unless its setting is set; the gateway
+bootstrap sets them all.
+
+| Setting | Effect |
+|---|---|
+| `EPISODE_BOX_INODES` | inode limit (xfs project `ihard`) next to Docker's block limit on the box's writable layer, sidecars included. Without it a box can fill the filesystem with empty files. Over the limit: ENOSPC in the box |
+| `EPISODE_MIN_FREE_DISK_BYTES` | opens are refused (503 `no_free_resources`, signed, retryable) while the Docker filesystem has less free space |
+| `EPISODE_DISK_{READ,WRITE}_{BPS,IOPS}` | the box's cgroup `io.max` on the Docker device, written right after start. Docker's `device_*_bps` fail under runsc's systemd cgroups. The Sentry and gofer do the box's I/O inside its scope |
+| `API_RATE_PER_KEY` / `API_BURST_PER_KEY` | requests per second per `Authorization` value (episode key, tenant token); 429 + Retry-After |
+| `API_RATE_PER_IP` / `API_BURST_PER_IP` | the same per client address: the last `X-Forwarded-For` entry from loopback (Caddy), else the peer |
+
+Measured on a Targon cpu-medium VM (xfs loop, runsc, 2026-11-13):
+
+- With the inode limit at 20,000, file creation stopped at 19,980 (ENOSPC).
+- With caps of 50 MiB/s write and 100 MiB/s read, `dd` measured 49.7 MB/s (fsync), 77 MB/s (`oflag=direct`, which gVisor buffers) and 105 MB/s (read). Uncapped: 571 / 791 MB/s.
+- API limits: one key got 11 of 40 requests through (burst 10), one address 39 of 60 (burst 30). A spoofed `X-Forwarded-For` prefix was ignored.

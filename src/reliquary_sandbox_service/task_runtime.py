@@ -781,6 +781,71 @@ class TaskBoxRuntime:
             self._remove_services(box_id)
             raise
 
+    # -- disk: free space, inodes, I/O ------------------------------------------
+
+    def _docker_root(self) -> str:
+        root = getattr(self, "_docker_root_dir", None)
+        if root is None:
+            root = self._docker_root_dir = self.client.info().get("DockerRootDir") or "/var/lib/docker"
+        return root
+
+    def disk_free_bytes(self) -> int:
+        """Free bytes of the Docker filesystem (where every box's writable layer lives)."""
+        stat = os.statvfs(self._docker_root())
+        return stat.f_bavail * stat.f_frsize
+
+    def _block_device(self) -> str:
+        """The block device holding the Docker root (its loop device on a gateway)."""
+        device = getattr(self, "_docker_block_device", None)
+        if device is None:
+            st = os.stat(self._docker_root())
+            name = Path(f"/sys/dev/block/{os.major(st.st_dev)}:{os.minor(st.st_dev)}").resolve().name
+            device = self._docker_block_device = "/dev/" + name
+        return device
+
+    def _io_max(self) -> str | None:
+        """The box's cgroup `io.max` line for the Docker device, None when no cap is set."""
+        caps = {"rbps": "episode_disk_read_bps", "wbps": "episode_disk_write_bps",
+                "riops": "episode_disk_read_iops", "wiops": "episode_disk_write_iops"}
+        set_ = [f"{key}={int(rate)}" for key, name in caps.items()
+                if (rate := getattr(self.settings, name, None))]
+        if not set_:
+            return None
+        st = os.stat(self._block_device())
+        return f"{os.major(st.st_rdev)}:{os.minor(st.st_rdev)} " + " ".join(set_)
+
+    def _limit_io(self, container: Any) -> None:
+        """Cap the box's disk throughput and IOPS (cgroup v2 `io.max`), written by us right after
+        start, before any agent code: Docker's device_*_bps fail under runsc's systemd cgroups.
+        The Sentry and gofer do the box's I/O inside its scope, so the cap covers it."""
+        line = self._io_max()
+        if line is None:
+            return
+        try:
+            (self._cgroup_scope(container.id) / "io.max").write_text(line + "\n")
+        except OSError as exc:
+            raise InfraFault("The box's disk I/O limit could not be set") from exc
+
+    def _cap_inodes(self, container: Any) -> None:
+        """Add an inode limit to the xfs project quota Docker gave the container's writable
+        layer (Docker sets only its block limit): a box cannot fill the filesystem with files."""
+        limit = getattr(self.settings, "episode_box_inodes", None)
+        if not limit or self.settings.episode_allow_unquoted_disk:
+            return
+        container.reload()
+        upper = ((container.attrs.get("GraphDriver") or {}).get("Data") or {}).get("UpperDir")
+        if not upper:
+            raise InfraFault("The box's writable layer is unknown")
+        found = subprocess.run(["xfs_io", "-c", "lsproj", upper], capture_output=True, text=True,
+                               timeout=30)
+        match = re.search(r"projid = (\d+)", found.stdout)
+        if found.returncode != 0 or not match or match.group(1) == "0":
+            raise InfraFault("The box's project quota id is unknown")
+        done = subprocess.run(["xfs_quota", "-x", "-c", f"limit -p ihard={int(limit)} {match.group(1)}",
+                               self._docker_root()], capture_output=True, text=True, timeout=30)
+        if done.returncode != 0:
+            raise InfraFault("The box's inode limit could not be set")
+
     def _service_network(self, box_id: str) -> str:
         """The private network of a box and its sidecars; also its bridge's name (<= 15)."""
         return "rq-ep-" + hashlib.sha256(self._name(box_id).encode()).hexdigest()[:9]
@@ -811,7 +876,9 @@ class TaskBoxRuntime:
                 pids_limit=SERVICE_PIDS, mem_limit=svc.memory_bytes, memswap_limit=svc.memory_bytes,
                 nano_cpus=min(spec.nano_cpus, round(svc.cpus * 1e9)), init=True, detach=True,
                 log_config=docker.types.LogConfig(type="none"), auto_remove=False, **options)
+            self._cap_inodes(container)
             container.start()
+            self._limit_io(container)
             container.reload()
             address = (((container.attrs.get("NetworkSettings") or {}).get("Networks") or {})
                        .get(net) or {}).get("IPAddress")
@@ -896,9 +963,11 @@ class TaskBoxRuntime:
             shutil.rmtree(self._etc_dir(box_id), ignore_errors=True)
             raise InfraFault("The task box could not be created") from exc
         try:
+            self._cap_inodes(container)
             for name in extra:  # the egress network too, for an online box with sidecars
                 self.client.networks.get(name).connect(container)
             container.start()
+            self._limit_io(container)
             container.reload()
             if container.status != "running":
                 raise InfraFault("The task box failed to start")

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Gateway limits, each off unless set (docs/egress.md, "Gateway limits"):
+  - `EPISODE_BOX_INODES`: per-box xfs inode limit;
+  - `EPISODE_MIN_FREE_DISK_BYTES`: opens refused 503 `no_free_resources` under the floor;
+  - `EPISODE_DISK_{READ,WRITE}_{BPS,IOPS}`: per-box cgroup `io.max`;
+  - `API_RATE_PER_KEY` / `API_RATE_PER_IP` and their bursts: 429 per credential or address.
+- The capacity report lists `images_pending` (approved images not present yet), so a validator can treat them as "later", not unplaceable.
 - Controlled egress for task boxes, off by default (docs/egress.md): `SandboxTask.network` (`TaskNetwork`: profile, agent/grading phases) or a verifiers env's `network` option; settings `EPISODE_EGRESS_NETWORK`, `EPISODE_EGRESS_PROFILES`, `EPISODE_EGRESS_ENVS`; the allowlisting, byte- and rate-capped proxy `reliquary_sandbox_service.egress_proxy` and `scripts/egress-host-setup.sh`. A task the machine offers no profile for is refused (422). Fingerprints and option digests of offline tasks are unchanged.
 - Sidecars (`SandboxTask.services`, `TaskService`): a task's other compose services, each in its own gVisor box on a private network with the task's box, which reaches them by name; their memory comes out of the task's. Fingerprints of tasks without services are unchanged.
 

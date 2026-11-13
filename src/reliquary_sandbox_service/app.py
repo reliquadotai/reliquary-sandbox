@@ -26,6 +26,7 @@ from reliquary_sandbox._proto.command_session import command_session_pb2 as pb
 from reliquary_sandbox.episode_task import VERIFIERS_ENTRY_PREFIX
 
 from .manager import ACTIVE, CreateRequest, Manager, timestamp
+from .rate_limit import RateLimit
 from .settings import Settings
 
 LOG = logging.getLogger(__name__)
@@ -259,6 +260,9 @@ def create_app(settings=None, runtime=None, task_runtime=None):
     app = FastAPI(title="Reliquary Sandbox", version="0.1.0", lifespan=lifespan,
                   docs_url=None, redoc_url=None, openapi_url=None)
     app.add_middleware(BodyLimit, limit=settings.max_file_bytes + 1024**2)
+    app.add_middleware(RateLimit, rate_per_key=settings.api_rate_per_key,
+                       burst_per_key=settings.api_burst_per_key,
+                       rate_per_ip=settings.api_rate_per_ip, burst_per_ip=settings.api_burst_per_ip)
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(request, exc):
